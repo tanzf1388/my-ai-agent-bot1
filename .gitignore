@@ -1,0 +1,8 @@
+TOKEN.txt
+.env
+config.json
+generated_pdfs/
+reference_docs/
+備用程式碼.txt
+__pycache__/
+*.pyc
