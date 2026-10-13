@@ -6,4 +6,5 @@ reference_docs/
 備用程式碼.txt
 __pycache__/
 *.pyc
-logs/
+bot.log
+.venv/
