@@ -29,11 +29,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 if exist "%SHORTCUT%" (
     echo.
     echo [OK] Auto-start enabled: %SHORTCUT%
-    echo The bot will start in the background after every login.
+    echo The bot will start in the background 2 minutes after every login.
     echo Logs: %~dp0logs\bot.log
     echo.
     choice /c YN /m "Start the bot in the background now"
-    if not errorlevel 2 wscript.exe "%~dp0start_run.vbs"
+    if not errorlevel 2 wscript.exe "%~dp0start_run.vbs" nodelay
 ) else (
     echo [FAILED] Could not create the Startup shortcut.
 )
