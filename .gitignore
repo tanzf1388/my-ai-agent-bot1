@@ -10,3 +10,4 @@ bot.log
 .venv/
 learning_data.json*
 auto_model.txt
+image_text_cache.json

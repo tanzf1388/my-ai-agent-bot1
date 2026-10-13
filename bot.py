@@ -753,6 +753,104 @@ def check_vision_capability():
 
 
 # ============================================================================
+# 📂 資料夾查找：reference_docs（含子資料夾）的圖片辨識成文字後快取，出題時當參考材料
+# ============================================================================
+IMAGE_CACHE_FILE = os.path.abspath("./image_text_cache.json")
+NEW_OCR_PER_QUIZ = 3      # 出題時最多現場辨識幾張還沒快取的圖（每張約 20 秒），其餘靠 !index 預先建立
+OCR_PROMPT = "請把這張圖片中的學習內容完整整理成繁體中文文字：抄錄所有文字，並描述圖表、公式、流程的重點。不要加入圖片以外的內容。"
+_cache_lock = threading.Lock()
+try:
+    with open(IMAGE_CACHE_FILE, encoding="utf-8") as f:
+        image_cache = json.load(f)   # 相對路徑 -> {"mtime": 修改時間, "text": 辨識文字}
+except Exception:
+    image_cache = {}
+
+
+def list_reference_files(exts) -> list:
+    return sorted(p for p in glob.glob(os.path.join(DOCS_REF_DIR, "**", "*"), recursive=True)
+                  if p.lower().endswith(exts))
+
+
+def cached_text(path: str) -> str:
+    """有快取且圖片沒被改過才回傳辨識文字，否則回傳空字串。"""
+    hit = image_cache.get(os.path.relpath(path, DOCS_REF_DIR))
+    return hit["text"] if hit and hit["mtime"] == os.path.getmtime(path) else ""
+
+
+def ocr_image(path: str) -> str:
+    """用視覺模型辨識單張圖片並寫入快取；失敗回傳 ❌ 開頭的訊息（不快取）。"""
+    with open(path, "rb") as f:
+        text = vision_chat([prepare_image(f.read())], OCR_PROMPT)
+    if not text.startswith("❌"):
+        with _cache_lock:
+            image_cache[os.path.relpath(path, DOCS_REF_DIR)] = {"mtime": os.path.getmtime(path), "text": text}
+            with open(IMAGE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(image_cache, f, ensure_ascii=False)
+    return text
+
+
+def folder_material(topic: str, limit: int = 4000):
+    """在 reference_docs 找與主題相關的圖片與 .txt/.md，回傳 (材料文字, 檔案數)。
+    比對『路徑』（例如 數學/極限/）與『已辨識的內容』，每次隨機抽不同頁讓題目有變化。"""
+    words = topic.lower().split()
+    files = list_reference_files(IMAGE_EXTS + (".txt", ".md"))
+    random.shuffle(files)
+    parts, size, new_ocr = [], 0, 0
+    for p in files:
+        if size >= limit:
+            break
+        rel = os.path.relpath(p, DOCS_REF_DIR)
+        is_img = p.lower().endswith(IMAGE_EXTS)
+        if is_img:
+            text = cached_text(p)
+        else:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        if not all(w in (rel + text).lower() for w in words):
+            continue
+        if is_img and not text:
+            if new_ocr >= NEW_OCR_PER_QUIZ:
+                continue
+            new_ocr += 1
+            text = ocr_image(p)
+            if text.startswith("❌"):
+                continue
+        parts.append(f"【{rel}】\n{text}")
+        size += len(text)
+    return "\n\n".join(parts), len(parts)
+
+
+indexing = False
+
+
+async def index_reference_images(message):
+    """背景把 reference_docs 裡還沒辨識的圖片全部辨識並快取，定時更新進度。"""
+    global indexing
+    files = [p for p in list_reference_files(IMAGE_EXTS) if not cached_text(p)]
+    if not files:
+        await message.reply("✅ 資料夾內的圖片都已建立索引。")
+        return
+    indexing = True
+    status = await message.reply(f"🔍 開始辨識 {len(files)} 張圖片（每張約 20 秒），完成後出題會更快、也能依內容查找。")
+    done = 0
+    try:
+        for p in files:
+            if guard.paused:
+                await status.edit(content=f"⏸️ GPU 暫停，索引停在 {done}/{len(files)}，恢復後再輸入 `!index` 繼續。")
+                return
+            text = await run_gpu(ocr_image, p)
+            if text.startswith("❌"):
+                await status.edit(content=f"{text}\n（索引停在 {done}/{len(files)}）")
+                return
+            done += 1
+            if done % 5 == 0:
+                await status.edit(content=f"🔍 辨識中 {done}/{len(files)}…")
+        await status.edit(content=f"✅ 已辨識 {done} 張圖片，`!quiz 主題` 會從資料夾內容找出題材料。")
+    finally:
+        indexing = False
+
+
+# ============================================================================
 # 📝 學習檢測：出題 / 批改 / 間隔複習 / 統計
 # ============================================================================
 QUIZ_MIN, QUIZ_MAX, QUIZ_DEFAULT = 1, 10, 5
@@ -1050,8 +1148,8 @@ async def handle_quiz_answer(message, session: dict, text: str):
 
 
 async def handle_learning_command(message, content: str, images_b64: list) -> bool:
-    """處理 !quiz / !review / !stats / !stop / !help。不是學習指令就回傳 False。"""
-    m = re.match(r"^!(quiz|review|stats|stop|help)\b\s*(.*)$", content.strip(), flags=re.S | re.I)
+    """處理 !quiz / !review / !stats / !stop / !index / !help。不是學習指令就回傳 False。"""
+    m = re.match(r"^!(quiz|review|stats|stop|index|help)\b\s*(.*)$", content.strip(), flags=re.S | re.I)
     if not m:
         return False
     cmd, arg = m.group(1).lower(), m.group(2).strip()
@@ -1064,6 +1162,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
+            "　　沒附圖時會先到 reference_docs 資料夾（含子資料夾）找相關的圖片/筆記當出題材料\n"
+            "`!index`　預先辨識資料夾裡所有圖片，之後出題更快、也能依圖片內容查找\n"
             "`!review [題數]`　複習錯題本（依間隔複習到期的題目）\n"
             "`!stats`　查看正確率與待加強主題\n"
             "`!stop`　結束目前的檢測\n\n"
@@ -1074,6 +1174,14 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
 
     if cmd == "stats":
         await message.reply(await asyncio.to_thread(build_stats_text, message.author.id))
+        return True
+
+    if cmd == "index":
+        notice = gpu_block_notice()
+        if indexing or notice:
+            await message.reply(notice or "索引已在進行中，請稍候。")
+        else:
+            asyncio.create_task(index_reference_images(message))   # 背景執行，不卡住其他訊息
         return True
 
     if cmd == "stop":
@@ -1117,6 +1225,10 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
                 return True
             material, source_note = extracted, f"（依據 {len(images_b64)} 張圖片）"
             topic = topic or "圖片內容"
+        elif topic:
+            material, count = await run_gpu(folder_material, topic)
+            if count:
+                source_note = f"（依據資料夾中 {count} 份相關資料）"
         if not topic:
             await message.reply("請告訴我要檢測的主題，例如：`!quiz Python 迴圈 5`，或附上筆記圖片再輸入 `!quiz`。")
             return True
@@ -1678,7 +1790,7 @@ async def on_message(message):
         await handle_quiz_answer(message, session, clean_input)
         return
 
-    is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|help)\b", clean_input, flags=re.I))
+    is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|index|help)\b", clean_input, flags=re.I))
     is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
@@ -1709,7 +1821,7 @@ async def on_message(message):
             if message.attachments or message.reference:
                 images_b64, image_notes = await collect_images(message)
 
-            # 學習檢測指令（!quiz / !review / !stats / !stop / !help）
+            # 學習檢測指令（!quiz / !review / !stats / !stop / !index / !help）
             if is_learning_cmd:
                 if await handle_learning_command(message, clean_input, images_b64):
                     return
