@@ -1,4 +1,59 @@
-WScript.Sleep 60000 ' 延遲 15 秒，等候網路與 Ollama 服務載入完成
+' ===========================================================================
+'  Hidden launcher for the Discord AI bot (used by Windows auto-start).
+'  1. Exits if the bot is already running (avoids double replies)
+'  2. Waits until Ollama answers on http://localhost:11434 (max 5 minutes)
+'  3. Starts run_background.bat with no visible window
+' ===========================================================================
+Option Explicit
 
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """C:\discord ai\run.bat""", 0, False
+Const OLLAMA_URL = "http://localhost:11434/api/tags"
+Const MAX_WAIT_SECONDS = 300
+
+Dim fso, shell, scriptDir
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+
+If IsBotRunning() Then WScript.Quit 0
+
+WaitForOllama
+
+shell.CurrentDirectory = scriptDir
+shell.Run "cmd /c """ & scriptDir & "\run_background.bat""", 0, False
+
+Function IsBotRunning()
+    Dim wmi, procs
+    IsBotRunning = False
+    On Error Resume Next
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE " & _
+        "((Name = 'python.exe' OR Name = 'pythonw.exe') AND CommandLine LIKE '%discord_ai.py%') " & _
+        "OR (Name = 'cmd.exe' AND CommandLine LIKE '%run_background.bat%')")
+    If Err.Number = 0 Then
+        If procs.Count > 0 Then IsBotRunning = True
+    End If
+    On Error GoTo 0
+End Function
+
+Sub WaitForOllama()
+    Dim waited, http
+    waited = 0
+    Do While waited < MAX_WAIT_SECONDS
+        On Error Resume Next
+        Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+        http.setTimeouts 2000, 2000, 2000, 2000
+        http.Open "GET", OLLAMA_URL, False
+        http.Send
+        If Err.Number = 0 Then
+            If http.Status = 200 Then
+                On Error GoTo 0
+                Exit Sub
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+        WScript.Sleep 5000
+        waited = waited + 5
+    Loop
+    ' Ollama still not ready: start anyway, the bot will retry on each request
+End Sub
