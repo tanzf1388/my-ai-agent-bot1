@@ -165,6 +165,11 @@ ALLOWED_USER_IDS = {1533017055736107045}
 
 # 模型設定（名稱必須與 `ollama list` 完全一致）
 TEXT_MODEL = getenv_user("TEXT_MODEL", "qwen3.5:9b")
+# 依硬體自動挑選最強模型（設 AUTO_MODEL=0 關閉）；挑選結果存檔，下次啟動直接沿用（舊模型可能已被刪除）
+AUTO_MODEL = getenv_user("AUTO_MODEL", "1") != "0"
+AUTO_MODEL_FILE = os.path.abspath("./auto_model.txt")
+if AUTO_MODEL and os.path.exists(AUTO_MODEL_FILE):
+    TEXT_MODEL = open(AUTO_MODEL_FILE, encoding="utf-8").read().strip() or TEXT_MODEL
 # 圖片識別用的模型。預設與文字模型相同；若該模型不支援視覺，改設環境變數，例如：
 #   $env:VISION_MODEL="qwen2.5vl:7b"   或   "gemma3:4b"
 VISION_MODEL = getenv_user("VISION_MODEL", TEXT_MODEL)
@@ -544,9 +549,8 @@ agent_executor = AgentExecutor(
 )
 
 # ----------------------------------------------------------------------------
-# 🧠 依硬體自動挑選最強模型（啟動時檢查；擁有者可用 !model auto 重新檢查）。設 AUTO_MODEL=0 關閉
+# 🧠 依硬體自動挑選最強模型（啟動時檢查；擁有者可用 !model auto 重新檢查），換好後刪除舊模型
 # ----------------------------------------------------------------------------
-AUTO_MODEL = getenv_user("AUTO_MODEL", "1") != "0"
 # (模型, 大小 GB, 是否 MoE)，由強到弱；MoE 每次只動用少量參數，部分放在系統記憶體仍夠快。qwen3.5 全系列都支援圖片
 MODEL_TIERS = [("qwen3.5:122b", 81, True), ("qwen3.5:35b", 22, True), ("qwen3.5:27b", 17, False),
                ("qwen3.5:9b-q8_0", 10, False), ("qwen3.5:9b", 6.6, False), ("qwen3.5:4b", 3.3, False),
@@ -602,7 +606,13 @@ def auto_select_model() -> str:
     if VISION_MODEL == TEXT_MODEL:   # 沒另外指定視覺模型時一起換
         VISION_MODEL = best
     TEXT_MODEL = llm.model = quiz_llm.model = best   # agent 共用同一個 llm 物件，直接生效
-    return info + f"\n✅ 已從 `{old}` 切換為 `{best}`"
+    with open(AUTO_MODEL_FILE, "w", encoding="utf-8") as f:
+        f.write(best)
+    info += f"\n✅ 已從 `{old}` 切換為 `{best}`"
+    if old in have and old != VISION_MODEL:   # 刪除舊模型釋放硬碟（另外指定的視覺模型不刪）
+        r = requests.delete(f"{OLLAMA_HOST}/api/delete", json={"model": old}, timeout=60)
+        info += f"，已刪除舊模型 `{old}`" if r.ok else f"（刪除舊模型失敗：{r.text[:100]}）"
+    return info
 
 # ============================================================================
 # 🖼️ 圖片識別
