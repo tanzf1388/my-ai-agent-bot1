@@ -82,6 +82,7 @@ import random
 import asyncio
 import threading
 import subprocess
+import shutil
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -542,6 +543,67 @@ agent_executor = AgentExecutor(
     early_stopping_method="force",
 )
 
+# ----------------------------------------------------------------------------
+# 🧠 依硬體自動挑選最強模型（啟動時檢查；擁有者可用 !model auto 重新檢查）。設 AUTO_MODEL=0 關閉
+# ----------------------------------------------------------------------------
+AUTO_MODEL = getenv_user("AUTO_MODEL", "1") != "0"
+# (模型, 大小 GB, 是否 MoE)，由強到弱；MoE 每次只動用少量參數，部分放在系統記憶體仍夠快。qwen3.5 全系列都支援圖片
+MODEL_TIERS = [("qwen3.5:122b", 81, True), ("qwen3.5:35b", 22, True), ("qwen3.5:27b", 17, False),
+               ("qwen3.5:9b-q8_0", 10, False), ("qwen3.5:9b", 6.6, False), ("qwen3.5:4b", 3.3, False),
+               ("qwen3.5:2b", 2.7, False), ("qwen3.5:0.8b", 1.2, False)]
+
+
+def detect_hardware() -> dict:
+    """回傳 CPU/GPU 名稱，以及 RAM、VRAM、Ollama 模型資料夾所在磁碟剩餘空間（GB）。"""
+    hw = {"cpu": "?", "gpu": "", "vram": 0.0, "ram": psutil.virtual_memory().total / 2**30 if psutil else 0.0}
+    if os.name == "nt":   # VRAM 讀登錄檔：Win32_VideoController.AdapterRAM 超過 4 GB 會被截斷
+        ps = ("$c=Get-CimInstance Win32_Processor|select -First 1;"
+              "$g=Get-ItemProperty 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' -EA 0|"
+              "?{$_.'HardwareInformation.qwMemorySize'}|sort 'HardwareInformation.qwMemorySize' -Desc|select -First 1;"
+              "\"$($c.Name.Trim())|$($g.DriverDesc)|$($g.'HardwareInformation.qwMemorySize')\"")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                                 timeout=30, creationflags=0x08000000).stdout.strip().split("|")
+            hw["cpu"], hw["gpu"], hw["vram"] = out[0], out[1], int(out[2] or 0) / 2**30
+        except Exception as e:
+            print(f"⚠️ 偵測顯卡失敗：{e}")
+    models_dir = getenv_user("OLLAMA_MODELS") or os.path.expanduser("~/.ollama/models")
+    hw["disk"] = shutil.disk_usage(models_dir if os.path.isdir(models_dir) else os.path.expanduser("~")).free / 2**30
+    return hw
+
+
+def pick_model(hw: dict, installed: set) -> str:
+    """由強到弱挑第一個放得下的：一般模型要整個放進顯存（沒獨顯則用一半 RAM），MoE 可再借一半 RAM；
+    沒下載過的還要硬碟留 5 GB 以上餘裕。"""
+    gpu = hw["vram"] if hw["vram"] >= 4 else 0   # 內顯當作沒有獨立顯卡
+    for name, size, moe in MODEL_TIERS:
+        mem = gpu + (hw["ram"] / 2 if moe or not gpu else 0)
+        if size + 1 <= mem and (name in installed or size + 5 <= hw["disk"]):
+            return name
+    return MODEL_TIERS[-1][0]
+
+
+def auto_select_model() -> str:
+    """偵測硬體 → 挑模型 → 沒有就下載 → 切換；下載失敗保留目前模型。同步函式，請用 asyncio.to_thread 呼叫。"""
+    global TEXT_MODEL, VISION_MODEL
+    hw = detect_hardware()
+    have = {m["name"] for m in requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10).json().get("models", [])}
+    best = pick_model(hw, have)
+    info = (f"CPU {hw['cpu']}｜RAM {hw['ram']:.0f} GB｜GPU {hw['gpu'] or '無'} {hw['vram']:.0f} GB｜"
+            f"硬碟剩 {hw['disk']:.0f} GB → 最適合 `{best}`")
+    if best == TEXT_MODEL:
+        return info + "（已在使用）"
+    if best not in have:
+        print(f"⬇️ 下載模型 {best}…")
+        r = requests.post(f"{OLLAMA_HOST}/api/pull", json={"model": best, "stream": False}, timeout=None)
+        if r.status_code != 200 or r.json().get("status") != "success":
+            return info + f"\n❌ 下載失敗，繼續使用 `{TEXT_MODEL}`：{r.text[:200]}"
+    old = TEXT_MODEL
+    if VISION_MODEL == TEXT_MODEL:   # 沒另外指定視覺模型時一起換
+        VISION_MODEL = best
+    TEXT_MODEL = llm.model = quiz_llm.model = best   # agent 共用同一個 llm 物件，直接生效
+    return info + f"\n✅ 已從 `{old}` 切換為 `{best}`"
+
 # ============================================================================
 # 🖼️ 圖片識別
 # ============================================================================
@@ -989,7 +1051,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!stats`　查看正確率與待加強主題\n"
             "`!stop`　結束目前的檢測\n\n"
             "**🖼️ 圖片識別**：直接附上圖片並 @我（或私訊），可加上你的問題；也可以回覆別人的圖片來提問。\n"
-            "**🎮 GPU 守護**：偵測到遊戲/剪片等吃 GPU 的程式時會自動暫停，擁有者可用 `!gpu` 查看與調整。")
+            "**🎮 GPU 守護**：偵測到遊戲/剪片等吃 GPU 的程式時會自動暫停，擁有者可用 `!gpu` 查看與調整。\n"
+            "**🧠 模型**：啟動時依硬體自動挑選最強模型，擁有者可用 `!model` 查看、`!model auto` 重新挑選。")
         return True
 
     if cmd == "stats":
@@ -1395,6 +1458,28 @@ def gpu_status_text() -> str:
     return "\n".join(lines)
 
 
+async def auto_model_task(message=None):
+    try:
+        text = await asyncio.to_thread(auto_select_model)
+    except Exception as e:
+        text = f"❌ 自動挑選模型失敗，繼續使用 `{TEXT_MODEL}`：{type(e).__name__}: {e}"
+    print(f"🧠 {text}")
+    if message:
+        await message.reply(f"🧠 {text}")
+    elif "已在使用" not in text:
+        await notify_owners(f"🧠 {text}")
+
+
+async def handle_model_command(message, content: str):
+    """!model 看目前模型；!model auto 依硬體重新挑選（可能下載），只有擁有者可用。"""
+    if message.author.id not in ALLOWED_USER_IDS:
+        return await message.reply("只有擁有者可以使用 `!model` 指令。")
+    if re.search(r"\bauto\b", content, flags=re.I):
+        await message.reply("🔍 偵測硬體並挑選模型中，若需要下載會花一些時間…")
+        return await auto_model_task(message)
+    await message.reply(f"🧠 目前模型：`{TEXT_MODEL}`（圖片：`{VISION_MODEL}`）。`!model auto` 依硬體重新挑選。")
+
+
 async def handle_gpu_command(message, content: str) -> bool:
     """!gpu 指令（只有 ALLOWED_USER_IDS 可用，因為會影響主機行為）。"""
     if message.author.id not in ALLOWED_USER_IDS:
@@ -1489,12 +1574,12 @@ async def expire_quiz_sessions_task():
         quiz_sessions.pop(k, None)
 
 
-_announced = False
+_announced = _model_checked = False
 
 
 @bot.event
 async def on_ready():
-    global _announced
+    global _announced, _model_checked
     if not auto_clean_memories_task.is_running():
         auto_clean_memories_task.start()
     if not expire_quiz_sessions_task.is_running():
@@ -1506,6 +1591,10 @@ async def on_ready():
     print(f"🎮 GPU 守護：{'啟用' if guard.enabled else '停用'}，監控 {len(gpu_watch)} 個程式，使用率門檻 {GPU_UTIL_THRESHOLD:.0f}%")
     print(f"🤖 {TEXT_MODEL} 全能 AI Agent 已成功上線：{bot.user}")
     await asyncio.to_thread(check_vision_capability)
+    if not _model_checked:   # 背景執行，下載大模型時 Bot 照常用舊模型回覆
+        _model_checked = True
+        if AUTO_MODEL:
+            asyncio.create_task(auto_model_task())
     if RUNNING_BACKGROUND and not _announced:   # on_ready 重新連線時會再觸發，只通知一次
         _announced = True
         await notify_owners("🟢 **Bot 已在背景啟動**。輸入 `!help` 看指令，`!gpu` 看 GPU 守護狀態。")
@@ -1542,13 +1631,14 @@ async def on_message(message):
         return
 
     is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|help)\b", clean_input, flags=re.I))
-    is_gpu_cmd = bool(re.match(r"^!gpu\b", clean_input, flags=re.I))
+    is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
     if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match):
         return
     if is_gpu_cmd:
-        await handle_gpu_command(message, clean_input)
+        handler = handle_model_command if clean_input[1:].lower().startswith("model") else handle_gpu_command
+        await handler(message, clean_input)
         return
     if ask_match:
         clean_input = ask_match.group(1).strip()
