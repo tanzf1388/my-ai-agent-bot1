@@ -1,4 +1,4 @@
 @echo off
-cd /d "C:\discord ai"
+cd /d "%~dp0"
 python discord_ai.py
 pause
