@@ -979,6 +979,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
 
     if cmd == "help":
         await message.reply(
+            "**💬 AI 提問**\n"
+            "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1540,11 +1542,18 @@ async def on_message(message):
 
     is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|help)\b", clean_input, flags=re.I))
     is_gpu_cmd = bool(re.match(r"^!gpu\b", clean_input, flags=re.I))
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd):
+    # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
+    ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match):
         return
     if is_gpu_cmd:
         await handle_gpu_command(message, clean_input)
         return
+    if ask_match:
+        clean_input = ask_match.group(1).strip()
+        if not clean_input and not message.attachments:
+            await message.reply("用法：`!ask 你的問題`，例如 `!ask 今天台股大盤表現如何？`（也可以附上圖片一起問）")
+            return
     if not clean_input and not message.attachments:
         return
 

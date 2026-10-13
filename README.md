@@ -2,6 +2,15 @@
 
 Discord + Ollama AI Agent Bot（主程式：`bot.py`）。
 
+## 常用指令
+
+| 指令 | 用途 |
+| --- | --- |
+| `!ask 問題` | 直接問 AI，在伺服器頻道不用 @Bot（可附上圖片一起問） |
+| `!help` | 查看所有指令 |
+
+私訊 Bot 或在頻道 @Bot 也可以直接對話。
+
 ## 開機自動背景執行（Windows）
 
 `bot_service.ps1` 會用 Windows「工作排程器」在**登入後 2 分鐘**自動於背景執行 `bot.py`，
