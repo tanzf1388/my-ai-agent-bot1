@@ -823,29 +823,33 @@ def folder_material(topic: str, limit: int = 4000):
 indexing = False
 
 
-async def index_reference_images(message):
-    """背景把 reference_docs 裡還沒辨識的圖片全部辨識並快取，定時更新進度。"""
+async def index_reference_images(message=None):
+    """辨識 reference_docs（任何學科、任何子資料夾）裡新增或修改過的圖片並快取。
+    message 有值＝`!index` 立即更新（回報進度）；None＝每 5 天自動更新（只寫 log）。沒有新圖片就直接結束。"""
     global indexing
     files = [p for p in list_reference_files(IMAGE_EXTS) if not cached_text(p)]
     if not files:
-        await message.reply("✅ 資料夾內的圖片都已建立索引。")
+        if message:
+            await message.reply("✅ 沒有新的圖片，索引已是最新。")
         return
     indexing = True
-    status = await message.reply(f"🔍 開始辨識 {len(files)} 張圖片（每張約 20 秒），完成後出題會更快、也能依內容查找。")
+    status = await message.reply(f"🔍 開始辨識 {len(files)} 張新圖片（每張約 20 秒），完成後出題會更快、也能依內容查找。") if message else None
+
+    async def report(text):
+        await status.edit(content=text) if status else print(f"📂 自動更新索引：{text}")
+
     done = 0
     try:
         for p in files:
             if guard.paused:
-                await status.edit(content=f"⏸️ GPU 暫停，索引停在 {done}/{len(files)}，恢復後再輸入 `!index` 繼續。")
-                return
+                return await report(f"⏸️ GPU 暫停，索引停在 {done}/{len(files)}，恢復後可輸入 `!index` 繼續。")
             text = await run_gpu(ocr_image, p)
             if text.startswith("❌"):
-                await status.edit(content=f"{text}\n（索引停在 {done}/{len(files)}）")
-                return
+                return await report(f"{text}\n（索引停在 {done}/{len(files)}）")
             done += 1
-            if done % 5 == 0:
-                await status.edit(content=f"🔍 辨識中 {done}/{len(files)}…")
-        await status.edit(content=f"✅ 已辨識 {done} 張圖片，`!quiz 主題` 會從資料夾內容找出題材料。")
+            if status and done % 5 == 0:
+                await report(f"🔍 辨識中 {done}/{len(files)}…")
+        await report(f"✅ 已辨識 {done} 張新圖片，`!quiz 主題` 會從資料夾內容找出題材料。")
     finally:
         indexing = False
 
@@ -1163,7 +1167,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
             "　　沒附圖時會先到 reference_docs 資料夾（含子資料夾）找相關的圖片/筆記當出題材料\n"
-            "`!index`　預先辨識資料夾裡所有圖片，之後出題更快、也能依圖片內容查找\n"
+            "`!index`　立即更新資料夾圖片索引（平常每 5 天自動更新），之後出題更快、也能依圖片內容查找\n"
             "`!review [題數]`　複習錯題本（依間隔複習到期的題目）\n"
             "`!stats`　查看正確率與待加強主題\n"
             "`!stop`　結束目前的檢測\n\n"
@@ -1727,6 +1731,13 @@ async def auto_clean_memories_task():
     clean_old_memories()
 
 
+@tasks.loop(hours=24 * 5)
+async def auto_index_task():
+    """每 5 天自動更新資料夾圖片索引（啟動時也會先檢查一次）；沒有新圖片就什麼都不做。"""
+    if not indexing and not guard.paused:
+        await index_reference_images()
+
+
 @tasks.loop(minutes=10)
 async def expire_quiz_sessions_task():
     now = datetime.now()
@@ -1746,6 +1757,8 @@ async def on_ready():
         expire_quiz_sessions_task.start()
     if not gpu_guard_task.is_running():
         gpu_guard_task.start()
+    if not auto_index_task.is_running():
+        auto_index_task.start()
     if psutil is None:
         print("⚠️ 未安裝 psutil，GPU 守護無法偵測程式（python -m pip install psutil）")
     print(f"🎮 GPU 守護：{'啟用' if guard.enabled else '停用'}，監控 {len(gpu_watch)} 個程式，使用率門檻 {GPU_UTIL_THRESHOLD:.0f}%")
