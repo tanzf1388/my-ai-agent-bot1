@@ -585,9 +585,12 @@ def pick_model(hw: dict, installed: set) -> str:
     return MODEL_TIERS[-1][0]
 
 
+MODEL_STATUS = ""   # 挑選/下載進行中的狀態（非空代表忙碌），!model 會顯示
+
+
 def auto_select_model() -> str:
     """偵測硬體 → 挑模型 → 沒有就下載 → 切換；下載失敗保留目前模型。同步函式，請用 asyncio.to_thread 呼叫。"""
-    global TEXT_MODEL, VISION_MODEL
+    global TEXT_MODEL, VISION_MODEL, MODEL_STATUS
     hw = detect_hardware()
     have = {m["name"] for m in requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10).json().get("models", [])}
     best = pick_model(hw, have)
@@ -597,10 +600,16 @@ def auto_select_model() -> str:
         return info + "（已在使用）"
     if best not in have:
         print(f"⬇️ 下載模型 {best}…")
-        r = requests.post(f"{OLLAMA_HOST}/api/pull", json={"model": best, "stream": False}, timeout=None)
-        if r.status_code != 200 or r.json().get("status") != "success":
-            return info + f"\n❌ 下載失敗，繼續使用 `{TEXT_MODEL}`：{r.text[:200]}"
+        last = {}
+        with requests.post(f"{OLLAMA_HOST}/api/pull", json={"model": best}, stream=True, timeout=(10, 600)) as r:
+            for line in r.iter_lines():   # 串流進度；中斷後重新下載會從斷點續傳
+                last = json.loads(line)
+                if last.get("total"):
+                    MODEL_STATUS = f"下載 `{best}` 中：{last.get('completed', 0) / 2**30:.1f}/{last['total'] / 2**30:.1f} GB"
+        if last.get("status") != "success":
+            return info + f"\n❌ 下載失敗，繼續使用 `{TEXT_MODEL}`：{last.get('error') or r.status_code}"
     old = TEXT_MODEL
+    requests.post(f"{OLLAMA_HOST}/api/generate", json={"model": old, "keep_alive": 0}, timeout=30)   # 先卸載舊模型，新舊不同時佔顯存
     if VISION_MODEL == TEXT_MODEL:   # 沒另外指定視覺模型時一起換
         VISION_MODEL = best
     TEXT_MODEL = llm.model = quiz_llm.model = best   # agent 共用同一個 llm 物件，直接生效
@@ -1467,10 +1476,18 @@ def gpu_status_text() -> str:
 
 
 async def auto_model_task(message=None):
+    global MODEL_STATUS
+    if MODEL_STATUS:   # 避免啟動檢查和 !model auto 同時下載
+        return message and await message.reply(f"⏳ {MODEL_STATUS}，請稍候。")
+    MODEL_STATUS = "偵測硬體中"
+    if message:
+        await message.reply("🔍 偵測硬體並挑選模型中，需要下載時可輸入 `!model` 看進度…")
     try:
         text = await asyncio.to_thread(auto_select_model)
     except Exception as e:
         text = f"❌ 自動挑選模型失敗，繼續使用 `{TEXT_MODEL}`：{type(e).__name__}: {e}"
+    finally:
+        MODEL_STATUS = ""
     print(f"🧠 {text}")
     if message:
         await message.reply(f"🧠 {text}")
@@ -1483,9 +1500,9 @@ async def handle_model_command(message, content: str):
     if message.author.id not in ALLOWED_USER_IDS:
         return await message.reply("只有擁有者可以使用 `!model` 指令。")
     if re.search(r"\bauto\b", content, flags=re.I):
-        await message.reply("🔍 偵測硬體並挑選模型中，若需要下載會花一些時間…")
         return await auto_model_task(message)
-    await message.reply(f"🧠 目前模型：`{TEXT_MODEL}`（圖片：`{VISION_MODEL}`）。`!model auto` 依硬體重新挑選。")
+    busy = f"\n⏳ {MODEL_STATUS}" if MODEL_STATUS else ""
+    await message.reply(f"🧠 目前模型：`{TEXT_MODEL}`（圖片：`{VISION_MODEL}`）。`!model auto` 依硬體重新挑選。{busy}")
 
 
 async def handle_gpu_command(message, content: str) -> bool:
