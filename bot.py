@@ -1102,7 +1102,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             return True
 
         # ---- !quiz ----
-        notice = gpu_block_notice()
+        notice = gpu_block_notice(message)
         if notice:
             await message.reply(notice)
             return True
@@ -1425,14 +1425,32 @@ class GpuGuard:
 guard = GpuGuard()
 
 
-def gpu_block_notice():
-    """暫停中就回傳要給使用者看的說明；沒暫停回傳 None。"""
+MAX_PENDING = 20
+pending_requests = {}   # 暫停期間被擋下的訊息（id → message），恢復後依序補回覆
+
+
+def gpu_block_notice(message=None):
+    """暫停中就回傳要給使用者看的說明（並把訊息排入恢復後補回覆的佇列）；沒暫停回傳 None。"""
     if not guard.paused:
         return None
     tail = "擁有者輸入 `!gpu resume` 後才會恢復" if guard.manual else f"程式關閉後約 {int(RESUME_AFTER_POLLS * GPU_POLL_SECONDS)} 秒會自動恢復"
+    queued = ""
+    if message and (message.id in pending_requests or len(pending_requests) < MAX_PENDING):
+        pending_requests[message.id] = message
+        queued = "\n📥 已記下這則訊息，恢復後我會自動回覆。"
     return (f"⏸️ **GPU 目前暫停使用**（{guard.reason}）\n"
             f"為了不影響主機上正在執行的程式，AI 對話與圖片識別暫時無法使用。{tail}。\n"
-            "學習檢測的作答（選擇題）、`!review`、`!stats` 仍可使用。")
+            "學習檢測的作答（選擇題）、`!review`、`!stats` 仍可使用。" + queued)
+
+
+async def replay_pending():
+    """GPU 恢復後，把暫停期間記下的訊息依序重新處理（若途中又暫停，會再排回佇列）。"""
+    while pending_requests and not guard.paused:
+        msg = pending_requests.pop(next(iter(pending_requests)))
+        try:
+            await on_message(msg)
+        except Exception as e:
+            print(f"⚠️ 補回覆失敗（訊息可能已刪除）：{e}")
 
 
 async def run_gpu(func, *args):
@@ -1455,7 +1473,7 @@ async def notify_owners(text: str):
 
 def pause_text(unloaded: int) -> str:
     mem = f"已把 {unloaded} 個模型從顯示卡記憶體卸載，" if unloaded else ""
-    return (f"⏸️ **已暫停使用 GPU**\n原因：{guard.reason}\n{mem}期間 AI 對話與圖片識別暫停，其他人傳訊息時我會說明原因。\n"
+    return (f"⏸️ **已暫停使用 GPU**\n原因：{guard.reason}\n{mem}期間 AI 對話與圖片識別暫停，其他人傳訊息時我會說明原因，恢復後自動補回覆。\n"
             f"程式關閉後約 {int(RESUME_AFTER_POLLS * GPU_POLL_SECONDS)} 秒會自動恢復；也可輸入 `!gpu resume` 手動恢復。")
 
 
@@ -1527,11 +1545,13 @@ async def handle_gpu_command(message, content: str) -> bool:
         else:
             guard.resume_manual()
             await message.reply("▶️ 已恢復使用 GPU。" + ("清單內的程式仍在執行，會先忽略到它們關閉為止。" if guard.override else ""))
+            asyncio.create_task(replay_pending())
     elif sub in ("on", "off"):
         guard.enabled = sub == "on"
         if not guard.enabled and guard.paused:
             guard.paused = guard.manual = False
         await message.reply("🟢 GPU 守護已啟用。" if guard.enabled else "⚪ GPU 守護已停用（若原本暫停中，已恢復）。")
+        asyncio.create_task(replay_pending())
     elif sub == "list":
         names = sorted(gpu_watch)
         await message.reply("**監控清單**（" + str(len(names)) + "）\n" + "、".join(names))
@@ -1573,7 +1593,9 @@ async def gpu_guard_task():
             await notify_owners(pause_text(n))
         elif event == "resume":
             print("▶️ GPU 恢復")
-            await notify_owners(f"▶️ **已恢復使用 GPU**（共暫停 {guard.paused_for()}）。AI 對話與圖片識別已可使用。")
+            await notify_owners(f"▶️ **已恢復使用 GPU**（共暫停 {guard.paused_for()}）。AI 對話與圖片識別已可使用。"
+                                + (f"正在補回覆暫停期間的 {len(pending_requests)} 則訊息。" if pending_requests else ""))
+            asyncio.create_task(replay_pending())
         elif guard.paused and guard.tick % 5 == 0:
             await asyncio.to_thread(unload_ollama_models)   # 暫停期間若有請求讓模型又被載入，再卸載一次
     except Exception as e:
@@ -1676,7 +1698,7 @@ async def on_message(message):
 
     # GPU 暫停中：需要模型的請求（一般對話、圖片識別）直接回覆通知，不再碰 GPU
     if not is_learning_cmd:
-        notice = gpu_block_notice()
+        notice = gpu_block_notice(message)
         if notice:
             await message.reply(notice)
             return
