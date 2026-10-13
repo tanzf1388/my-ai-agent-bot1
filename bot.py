@@ -488,6 +488,7 @@ RULES:
 6. CRITICAL: IMMEDIATELY AFTER getting Observation:, output Thought -> Final Answer in Traditional Chinese!
 7. If the history contains an image analysis result, treat it as the content of the image the user shared earlier.
 8. If the user wants a quiz or practice questions, tell them to use `!quiz 主題` (see `!help`); do not make up questions yourself.
+9. If the input contains [此使用者的學習紀錄], answer questions about their scores/weak topics from it directly without tools.
 
 Begin!
 
@@ -1604,6 +1605,11 @@ async def on_message(message):
                     reply_context = f"[正在回覆訊息 ('{ref_msg.author.display_name}': {ref_msg.content})]\n"
                 except Exception:
                     pass
+
+            # 問到成績/學習狀況時，附上該使用者的 !stats 摘要讓 AI 參考
+            if re.search(r"成績|分數|正確率|弱|測驗|檢測|考試|學習|複習|錯題", clean_input):
+                stats = await asyncio.to_thread(build_stats_text, message.author.id)
+                reply_context += f"[此使用者的學習紀錄]\n{stats}\n"
 
             history_text = format_chat_history(message.channel.id)
             full_user_input = f"{reply_context}{clean_input}"
