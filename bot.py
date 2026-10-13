@@ -1212,6 +1212,7 @@ def scan_gpu_apps(watch: set) -> set:
 
 GPU_UTIL_SAMPLE_SECONDS = 5.0   # 讀取使用率的最短間隔（啟動 PowerShell 有成本，不必每 3 秒讀一次）
 _ENGINE_RE = re.compile(r"pid_(\d+)_luid_(\S+?)_phys_\d+_eng_\d+_engtype_(.+)$", re.I)
+_AI_PROC_RE = re.compile(r"ollama|llama[-_]?server", re.I)   # Ollama 與它的推論程序（新版是 llama-server.exe）
 _nvsmi_available = None
 _win_counters_ok = None      # None=尚未確定；True=可用；False=此電腦讀不到，改用 nvidia-smi
 _win_counter_fails = 0
@@ -1228,7 +1229,7 @@ def _pid_name(pid: int) -> str:
 def aggregate_gpu_engines(rows, name_of=_pid_name):
     """彙整 Windows「GPU Engine」計數器。rows=[(執行個體名稱, 使用率)]。
     做法和工作管理員一樣：同一顆 GPU 的同類引擎（3D、Compute…）把各程序加總，取最高者。
-    Ollama 自己的程序不算（那是 Bot 自己的負載）。回傳 (使用率, 佔用最多的程式名稱)。"""
+    Ollama 與其推論程序不算（那是 Bot 自己的 AI 負載）。回傳 (使用率, 佔用最多的程式名稱)。"""
     sums, per_pid, names = {}, {}, {}
     for inst, val in rows:
         m = _ENGINE_RE.search(inst)
@@ -1238,7 +1239,7 @@ def aggregate_gpu_engines(rows, name_of=_pid_name):
         key = (m.group(2), m.group(3).strip().lower())
         if pid not in names:
             names[pid] = name_of(pid)
-        if "ollama" in names[pid].lower():
+        if _AI_PROC_RE.search(names[pid]):
             continue
         sums[key] = sums.get(key, 0.0) + val
         per_pid[(key, pid)] = per_pid.get((key, pid), 0.0) + val
