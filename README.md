@@ -1,27 +1,33 @@
 # my-ai-agent-bot1
 
-Discord + Ollama AI Agent Bot。
+Discord + Ollama AI Agent Bot（主程式：`bot.py`）。
 
 ## 開機自動背景執行（Windows）
 
-| 檔案 | 用途 |
+`bot_service.ps1` 會用 Windows「工作排程器」在**登入後 2 分鐘**自動於背景執行 `bot.py`，
+不會出現視窗，也不會重複啟動。不需要系統管理員權限。
+
+### 安裝
+
+1. 在 `bot.py` 所在資料夾放一個 `TOKEN.txt`，內容是 Discord Bot Token
+   （直接寫 Token 或 `DISCORD_TOKEN=...` 都可以）。
+   - `TOKEN.txt` 已列在 `.gitignore`，不會上傳到 GitHub。
+   - 沒有 `TOKEN.txt` 時，安裝過程會請你手動貼上 Token。
+2. 在該資料夾開啟 PowerShell 執行：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\bot_service.ps1 install
+   ```
+3. 之後每次登入 Windows，Bot 都會在 2 分鐘後自動於背景執行。
+
+Python 會優先使用資料夾內的 `.venv\Scripts\pythonw.exe`，沒有 `.venv` 時改用系統安裝的 Python。
+
+### 管理指令
+
+| 指令 | 用途 |
 | --- | --- |
-| `install_autostart.bat` | 開啟開機自動啟動（在「啟動」資料夾建立捷徑，不需系統管理員權限） |
-| `uninstall_autostart.bat` | 關閉開機自動啟動，並可選擇同時停止 Bot |
-| `stop_bot.bat` | 停止正在背景執行的 Bot |
-| `start_run.vbs` | 隱藏視窗啟動器：開機（登入）後等待 2 分鐘 → 避免重複啟動 → 等待 Ollama 就緒（最多 5 分鐘）→ 背景啟動 |
-| `run_background.bat` | 背景執行 `discord_ai.py`，輸出寫入 `logs\bot.log`，當機後 15 秒自動重啟 |
-| `run_ai.bat` | 前景手動執行（有視窗，方便除錯） |
+| `.\bot_service.ps1 status` | 查看排程、Bot 是否執行中與最近的記錄 |
+| `.\bot_service.ps1 log` | 即時查看記錄檔 `bot.log`（Ctrl+C 離開） |
+| `.\bot_service.ps1 start` / `stop` / `restart` | 啟動 / 停止 / 重新啟動 |
+| `.\bot_service.ps1 uninstall` | 移除開機自動啟動並停止 Bot |
 
-### 設定步驟
-
-1. 確認 Ollama 已設定為開機自動啟動（Ollama 安裝後預設即會自動啟動）。
-2. 雙擊 `install_autostart.bat`。
-   - 若尚未設定永久的 `DISCORD_TOKEN` 環境變數，腳本會請你貼上 Token 並以 `setx` 保存
-     （PowerShell 的 `$env:DISCORD_TOKEN` 只在當下視窗有效，開機後會失效）。
-3. 之後每次登入 Windows，Bot 會在 **2 分鐘後** 於背景自動執行，不會出現任何視窗。
-   - 想調整等待時間，修改 `start_run.vbs` 中的 `STARTUP_DELAY_SECONDS`（單位：秒）。
-4. 執行紀錄請看 `logs\bot.log`。
-
-> 專案資料夾可以放在任何位置，腳本會自動使用自己所在的資料夾；
-> 但若之後搬移資料夾，請重新執行一次 `install_autostart.bat`。
+想調整啟動延遲，修改 `bot_service.ps1` 開頭的 `$StartDelay`（例如 `PT2M` = 2 分鐘、`PT30S` = 30 秒）後重新執行 `install`。
