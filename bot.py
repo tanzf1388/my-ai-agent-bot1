@@ -551,10 +551,9 @@ agent_executor = AgentExecutor(
 # ----------------------------------------------------------------------------
 # 🧠 依硬體自動挑選最強模型（啟動時檢查；擁有者可用 !model auto 重新檢查），換好後刪除舊模型
 # ----------------------------------------------------------------------------
-# (模型, 大小 GB, 是否 MoE)，由強到弱；MoE 每次只動用少量參數，部分放在系統記憶體仍夠快。qwen3.5 全系列都支援圖片
-MODEL_TIERS = [("qwen3.5:122b", 81, True), ("qwen3.5:35b", 22, True), ("qwen3.5:27b", 17, False),
-               ("qwen3.5:9b-q8_0", 10, False), ("qwen3.5:9b", 6.6, False), ("qwen3.5:4b", 3.3, False),
-               ("qwen3.5:2b", 2.7, False), ("qwen3.5:0.8b", 1.2, False)]
+# (模型, 大小 GB)，由強到弱。qwen3.5 全系列都支援圖片
+MODEL_TIERS = [("qwen3.5:122b", 81), ("qwen3.5:27b", 17), ("qwen3.5:9b-q8_0", 10), ("qwen3.5:9b", 6.6),
+               ("qwen3.5:4b", 3.3), ("qwen3.5:2b", 2.7), ("qwen3.5:0.8b", 1.2)]
 
 
 def detect_hardware() -> dict:
@@ -577,12 +576,11 @@ def detect_hardware() -> dict:
 
 
 def pick_model(hw: dict, installed: set) -> str:
-    """由強到弱挑第一個放得下的：一般模型要整個放進顯存（沒獨顯則用一半 RAM），MoE 可再借一半 RAM；
-    沒下載過的還要硬碟留 5 GB 以上餘裕。"""
-    gpu = hw["vram"] if hw["vram"] >= 4 else 0   # 內顯當作沒有獨立顯卡
-    for name, size, moe in MODEL_TIERS:
-        mem = gpu + (hw["ram"] / 2 if moe or not gpu else 0)
-        if size + 1 <= mem and (name in installed or size + 5 <= hw["disk"]):
+    """由強到弱挑第一個能整個放進顯存、還留 2 GB 給對話快取與桌面的模型，絕不爆顯存
+    （沒有獨顯才改用一半 RAM）；沒下載過的還要硬碟留 5 GB 以上餘裕。"""
+    mem = hw["vram"] if hw["vram"] >= 4 else hw["ram"] / 2   # 內顯當作沒有獨立顯卡
+    for name, size in MODEL_TIERS:
+        if size + 2 <= mem and (name in installed or size + 5 <= hw["disk"]):
             return name
     return MODEL_TIERS[-1][0]
 
