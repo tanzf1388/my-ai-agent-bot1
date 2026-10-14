@@ -7,9 +7,25 @@ Discord + Ollama AI Agent Bot（主程式：`bot.py`）。
 | 指令 | 用途 |
 | --- | --- |
 | `!ask 問題` | 直接問 AI，在伺服器頻道不用 @Bot（可附上圖片一起問） |
+| `!image 描述` | 用本機 ComfyUI 生成圖片（`!img` 也可以） |
+| `!video 描述` | 用本機 ComfyUI 生成約 3 秒的短影片 |
 | `!help` | 查看所有指令 |
 
 私訊 Bot 或在頻道 @Bot 也可以直接對話。
+
+## 生圖 / 生影片（ComfyUI）
+
+`!image`、`!video` 會呼叫本機 ComfyUI Desktop 的 API（預設 `http://127.0.0.1:8188`）。
+ComfyUI 沒開時 Bot 會在背景自動啟動它，生成完就關閉；若是你自己開著 ComfyUI Desktop，則只請它卸載模型。
+生成前會先把 Ollama 模型移出顯存，生成期間 AI 對話會排隊等候，兩者不會同時佔用顯存。
+
+| 用途 | 模型（放在 ComfyUI 的 models 資料夾） |
+| --- | --- |
+| 圖片 | Z-Image Turbo：`diffusion_models/z_image_turbo_bf16.safetensors`、`text_encoders/qwen_3_4b.safetensors`、`vae/ae.safetensors` |
+| 影片 | Wan 2.2 TI2V 5B：`diffusion_models/wan2.2_ti2v_5B_fp16.safetensors`、`text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors`、`vae/wan2.2_vae.safetensors` |
+
+影片模型可在 ComfyUI Desktop 開啟「Wan 2.2 5B」影片範本後下載。ComfyUI 不在預設位置時，
+可設定環境變數 `COMFY_URL`（API 位址）或 `COMFY_HOME`（Comfy-Desktop 資料夾）。
 
 ## 開機自動背景執行（Windows）
 
