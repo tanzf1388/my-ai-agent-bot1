@@ -1267,6 +1267,7 @@ PAUSE_AFTER_POLLS = 2          # 清單內程式連續出現 2 次（約 6 秒�
 RESUME_AFTER_SECONDS = 30      # 連續 30 秒都沒事才恢復，避免反覆切換
 NOTIFY_USER_IDS = set(ALLOWED_USER_IDS)   # 暫停/恢復時私訊誰；預設是擁有者
 GPU_GUARD_FILE = os.path.abspath("./gpu_guard.json")
+GPU_STATE_FILE = os.path.join(BASE_DIR, "gpu_state.json")
 
 
 def _app_key(name: str) -> str:
@@ -1727,6 +1728,13 @@ async def gpu_guard_task():
             await asyncio.to_thread(unload_ollama_models)   # 暫停期間若有請求讓模型又被載入，再卸載一次
     except Exception as e:
         print(f"⚠️ GPU 守護輪詢錯誤：{type(e).__name__}: {e}")
+    finally:   # 給 local_ai.py（Claude Code 分工給本機模型用）讀的狀態
+        try:
+            with open(GPU_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"time": time.time(), "paused": guard.paused, "reason": guard.reason,
+                           "generating": gen_lock.locked()}, f, ensure_ascii=False)
+        except OSError:
+            pass
 
 
 # ============================================================================
