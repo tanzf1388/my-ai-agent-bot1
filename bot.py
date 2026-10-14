@@ -1929,7 +1929,9 @@ def claude_ask(prompt: str, model: str = None, timeout: int = 600) -> str:
     exe = find_claude()
     if not exe:
         raise RuntimeError("找不到 claude CLI，請先安裝 Claude Code")
-    r = subprocess.run([exe, "-p", "--output-format", "text"] + (["--model", model] if model else []), input=prompt, capture_output=True, text=True,
+    # 只開放唯讀的網路搜尋與讀取網頁，讓 Claude 能查最新資料；其他工具（改檔、執行指令）一律不開
+    r = subprocess.run([exe, "-p", "--output-format", "text", "--allowedTools", "WebSearch,WebFetch"]
+                       + (["--model", model] if model else []), input=prompt, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=timeout, cwd=BASE_DIR, creationflags=0x08000000)
     out = (r.stdout or "").strip()
     if r.returncode or not out:
