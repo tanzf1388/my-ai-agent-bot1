@@ -8,7 +8,7 @@ Discord + Ollama AI Agent Bot（主程式：`bot.py`）。
 | --- | --- |
 | `!ask 問題` | 直接問 AI，在伺服器頻道不用 @Bot（可附上圖片一起問） |
 | `!image 描述` | 用本機 ComfyUI 生成圖片（`!img` 也可以） |
-| `!video 描述` | 用本機 ComfyUI 生成約 3 秒的短影片 |
+| `!video 描述` | 用本機 ComfyUI 生成約 3 秒的短影片（RX 9070 XT 約 15 分鐘） |
 | `!help` | 查看所有指令 |
 
 私訊 Bot 或在頻道 @Bot 也可以直接對話。
@@ -24,7 +24,7 @@ ComfyUI 沒開時 Bot 會在背景自動啟動它，生成完就關閉；若是�
 | 圖片 | Z-Image Turbo：`diffusion_models/z_image_turbo_bf16.safetensors`、`text_encoders/qwen_3_4b.safetensors`、`vae/ae.safetensors` |
 | 影片 | Wan 2.2 TI2V 5B：`diffusion_models/wan2.2_ti2v_5B_fp16.safetensors`、`text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors`、`vae/wan2.2_vae.safetensors` |
 
-影片模型可在 ComfyUI Desktop 開啟「Wan 2.2 5B」影片範本後下載。ComfyUI 不在預設位置時，
+影片模型可在 ComfyUI Desktop 開啟「Wan 2.2 5B」影片範本後下載。Bot 啟動 ComfyUI 時會加上 `--bf16-unet`（AMD 顯卡用 fp16 會產生全灰影片）。ComfyUI 不在預設位置時，
 可設定環境變數 `COMFY_URL`（API 位址）或 `COMFY_HOME`（Comfy-Desktop 資料夾）。
 
 ## 開機自動背景執行（Windows）

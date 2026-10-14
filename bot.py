@@ -1165,7 +1165,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
-            "`!video 描述`　生成約 3 秒的短影片（需要較久）\n\n"
+            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1770,11 +1770,11 @@ def ensure_comfy() -> str:
     global comfy_proc
     shared = os.path.join(COMFY_HOME, "ComfyUI-Shared")
     comfy_proc = subprocess.Popen([py, "main.py", "--listen", "127.0.0.1", "--port", str(urlparse(COMFY_URL).port or 8188),
-                      "--disable-auto-launch", "--output-directory", os.path.join(shared, "output"),
+                      "--disable-auto-launch", "--bf16-unet", "--output-directory", os.path.join(shared, "output"),
                       "--input-directory", os.path.join(shared, "input"), "--extra-model-paths-config",
                       os.path.join(os.environ.get("APPDATA", ""), "Comfy Desktop", "shared_model_paths.yaml")],
                      cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     creationflags=0x08000000)   # 無視窗
+                     creationflags=0x08000000)   # 無視窗；--bf16-unet：AMD 上 fp16 會讓 Wan 影片溢位成全灰畫面
     for _ in range(90):
         time.sleep(2)
         if up():
@@ -1821,7 +1821,10 @@ def comfy_generate(kind: str, prompt: str):
     deadline = time.time() + COMFY_TIMEOUT
     while time.time() < deadline:
         time.sleep(2)
-        st = (comfy_api(f"/history/{pid}").get(pid) or {}).get("status", {})
+        try:
+            st = (comfy_api(f"/history/{pid}").get(pid) or {}).get("status", {})
+        except requests.RequestException:   # 載入大模型時 RAM 吃緊，連線偶爾會暫時失敗
+            continue
         if st.get("status_str") == "error":
             errs = [m[1].get("exception_message", "") for m in st.get("messages", []) if m[0] == "execution_error"]
             raise RuntimeError("；".join(errs).strip() or "ComfyUI 執行失敗")
@@ -1869,7 +1872,7 @@ async def handle_generate_command(message, kind: str, prompt: str):
         try:
             if guard.paused:   # 排隊期間 GPU 被暫停
                 return await status.edit(content=gpu_block_notice())
-            await status.edit(content=f"🎨 正在生成{word}…" + ("（影片約需數分鐘）" if kind == "video" else ""))
+            await status.edit(content=f"🎨 正在生成{word}…" + ("（影片約需 15 分鐘）" if kind == "video" else ""))
             err = await asyncio.to_thread(ensure_comfy)
             missing = [] if err else await asyncio.to_thread(missing_models, kind)
             if err or missing:
