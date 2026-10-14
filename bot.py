@@ -1961,12 +1961,18 @@ async def answer_with_takeover(message, prompt: str, local_call) -> str:
     return await (local or local_call())
 
 
+SVG_STYLE = (   # 預設畫風（使用者在描述中指定其他風格時以使用者為準）
+    "電影感的動態圖像風格：近黑的深色背景（可加細小星點），單一主體搭配大量留白與景深；"
+    "暖色主光源（白熱核心向金橙漸層）用 radialGradient 與 feGaussianBlur 做出柔和光暈；"
+    "主體要有立體寫實感：明暗交界、表面紋理（可用 feTurbulence）、邊緣的大氣光；"
+    "可加由細小光點與細線組成、透明度漸變的軌道或粒子環；文字低調，用大號細字半透明放在角落。"
+    "避免扁平卡通、粗黑輪廓與大面積純色塊。")
 EDGE = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe")
 
 
 def claude_svg(prompt: str):
     """Claude 用 SVG 畫圖，再用 Edge 無頭模式轉成 PNG（Discord 不會預覽 SVG）。回傳 (svg, png 或 None)。"""
-    out = claude_ask(f"請用 SVG 畫出：{prompt}\n只輸出一個完整的 <svg> 元素（含 xmlns 與 viewBox），不要任何說明文字或程式碼框。")
+    out = claude_ask(f"請用 SVG 畫出：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n只輸出一個完整的 <svg> 元素（含 xmlns 與 viewBox），不要任何說明文字或程式碼框。")
     m = re.search(r"<svg\b.*</svg>", out, re.S)
     if not m:
         raise RuntimeError("Claude 沒有回傳 SVG")
