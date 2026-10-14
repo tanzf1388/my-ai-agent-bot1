@@ -1987,9 +1987,10 @@ async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool 
     remote = asyncio.ensure_future(asyncio.to_thread(claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
+        text = remote.result()
         if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
-            return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, remote.result())
-        return "🧠 （由 Claude 接手完成）\n" + remote.result()
+            return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, text)
+        return "🧠 （由 Claude 接手完成）\n" + text
     if remote.done():
         await message.channel.send(f"⚠️ Claude 無法接手：{str(remote.exception())[:300]}\n改由本機模型繼續處理。")
     return await (local or local_call())
@@ -2038,7 +2039,8 @@ ANIM_MAX_SECONDS = 600   # 錄影是即時的，最長 10 分鐘
 ANIM_BYTES = 9_000_000   # Discord 一般上傳上限 10 MB，留一點餘裕；影片越長位元率越低（畫質下降）
 ANIM_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(秒|分鐘|分|sec|s|min)(?![a-z])\s*", re.I)
 ANIM_RECORDER = """<script>addEventListener('load', () => setTimeout(() => {
-  const rec = new MediaRecorder(document.querySelector('canvas').captureStream(30),
+  const cv = [...document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  const rec = new MediaRecorder(cv.captureStream(30),
                                 {mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: %d}), parts = [];
   rec.ondataavailable = e => parts.push(e.data);
   rec.onstop = () => { const r = new FileReader(); r.onload = () => window.__video = r.result.split(',')[1];
@@ -2056,26 +2058,44 @@ def parse_anim_duration(prompt: str):
     return max(1, min(round(sec), ANIM_MAX_SECONDS)), prompt[m.end():]
 
 
+ANIM_POLISH = (   # 讓畫面更有質感、但不突兀的電影級後製要求
+    "質感要求：所有鏡頭移動與轉場都用 easeInOut 緩動，場景之間用淡入淡出或連續推軌銜接，不要硬切或跳動；"
+    "用 globalCompositeOperation='lighter' 做柔和的光暈（bloom），前後景分層並模糊遠景做出景深；"
+    "加上極輕微的膠片顆粒、暗角與色調統一的調色；光點與粒子要有拖尾的動態模糊。"
+    "效能：靜態圖層（星空、紋理）先畫到離屏 canvas 再貼上，粒子數量控制在每格都能穩定 30fps，避免掉格。")
+
+
 def claude_anim(prompt: str, seconds: int = ANIM_SECONDS) -> bytes:
     """Claude 寫 canvas 程式動畫，用 Edge 無頭模式即時錄成 webm（像參考影片那樣「每一格都由程式算出來」）。"""
     from playwright.sync_api import sync_playwright
     out = claude_ask(f"請寫一個 HTML 動畫：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n"
-                     f"規格：只用一個 1280x720 的 <canvas> 畫全部內容，requestAnimationFrame 依經過時間播放，"
-                     f"總長 {seconds} 秒（內容要撐滿整段時間）、鏡頭與畫面要持續變化；不可載入任何外部資源。只輸出完整 HTML，不要說明文字。",
+                     f"規格：只用一個 1920x1080 的 <canvas> 畫全部內容，requestAnimationFrame 依經過時間播放，"
+                     f"總長 {seconds} 秒（內容要撐滿整段時間）、鏡頭與畫面要持續變化；不可載入任何外部資源。\n{ANIM_POLISH}\n"
+                     "只輸出完整 HTML，不要說明文字。",
                      model="sonnet", timeout=1200)   # 實測 sonnet 約 10 分鐘，品質明顯比 haiku 好
-    m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", out, re.S | re.I)
-    if not m or "<canvas" not in m.group(0):
-        raise RuntimeError("Claude 沒有回傳 canvas 動畫")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(channel="msedge", headless=True)
-        try:
-            page = browser.new_page(viewport={"width": 1280, "height": 720})
-            bitrate = min(4_000_000, ANIM_BYTES * 8 // seconds)
-            page.set_content(m.group(0) + ANIM_RECORDER % (bitrate, seconds * 1000))
-            page.wait_for_function("window.__video", timeout=(seconds + 60) * 1000)
-            return base64.b64decode(page.evaluate("window.__video"))
-        finally:
-            browser.close()
+    for attempt in range(2):   # 錄不到畫面（程式出錯）就把錯誤丟回給 Claude 修一次
+        m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", out, re.S | re.I)
+        errors = [] if m else ["沒有回傳完整 HTML"]
+        if m:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(channel="msedge", headless=True)
+                try:
+                    page = browser.new_page(viewport={"width": 1920, "height": 1080})
+                    page.on("pageerror", lambda e: errors.append(str(e)))
+                    bitrate = min(4_000_000, ANIM_BYTES * 8 // seconds)
+                    page.set_content(m.group(0) + ANIM_RECORDER % (bitrate, seconds * 1000))
+                    page.wait_for_function("window.__video", timeout=(seconds + 60) * 1000)
+                    data = base64.b64decode(page.evaluate("window.__video"))
+                finally:
+                    browser.close()
+            if len(data) > 50_000:
+                return data
+            errors = errors or ["錄到的畫面是空的（主 canvas 沒有更新）"]
+        if attempt == 0:
+            out = claude_ask(f"你寫的 HTML 動畫錄影失敗，錯誤：{'；'.join(errors)[:1000]}\n請修正後只輸出完整 HTML。"
+                             f"注意：錄影會抓頁面 DOM 中最大的 <canvas>，畫面必須畫在它上面。\n原始程式：\n{out}",
+                             model="sonnet", timeout=1200)
+    raise RuntimeError("動畫錄影失敗：" + "；".join(errors)[:300])
 
 
 async def handle_anim_command(message, prompt: str) -> bool:
@@ -2083,7 +2103,7 @@ async def handle_anim_command(message, prompt: str) -> bool:
         await message.reply("用法：`!anim [長度] 描述`，例如 `!anim 30秒 從地球飛向火星的鏡頭`（沒寫長度就是 15 秒）")
         return True
     seconds, prompt = parse_anim_duration(prompt)
-    note = "；超過 20 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 20 else ""
+    note = "；超過 18 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 18 else ""
     status = await message.reply(f"🎬 Claude 正在製作 {seconds} 秒的程式動畫（寫程式約 10 分鐘，再加上錄影 {seconds} 秒{note}）…")
     try:
         data = await asyncio.to_thread(claude_anim, prompt, seconds)
