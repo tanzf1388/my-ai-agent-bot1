@@ -84,6 +84,7 @@ import threading
 import subprocess
 import shutil
 import tempfile
+import html as html_lib
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -1169,7 +1170,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
-            "`!anim 描述`　由 Claude 寫程式動畫並錄成 15 秒影片（約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
+            "`!anim [長度] 描述`　由 Claude 寫程式動畫並錄成影片，例如 `!anim 30秒 星空`（預設 15 秒，最長 10 分鐘；寫程式約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1945,7 +1946,36 @@ TAKEOVER_SECONDS = float(getenv_user("TAKEOVER_SECONDS", "60"))   # 本機模型
 LONG_TASK_RE = re.compile(r"長篇|詳細|完整|報告|講義|企劃|論文|教學|全文|\d{3,}\s*字")
 
 
-async def answer_with_takeover(message, prompt: str, local_call) -> str:
+PDF_RE = re.compile(r"pdf", re.I)
+PDF_HINT = ("\n\n使用者要的是 PDF：不要自己建立檔案，"
+            "請把完整內容輸出成一份完整的 HTML 文件（含 <style>，A4 版面、字型用 Microsoft JhengHei），機器人會自動轉成 PDF。")
+
+
+def html_to_pdf(text: str) -> str:
+    """把 Claude 輸出的 HTML（不是 HTML 就當純文字排版）用 Edge 無頭模式印成 PDF，回傳檔案路徑。"""
+    m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", text, re.S | re.I)
+    html = m.group(0) if m else ("<meta charset='utf-8'><body style=\"font-family:'Microsoft JhengHei';"
+                                  "white-space:pre-wrap;line-height:1.7\">" + html_lib.escape(text))
+    os.makedirs(PDF_OUTPUT_DIR, exist_ok=True)
+    base = os.path.join(PDF_OUTPUT_DIR, f"claude_{datetime.now():%Y%m%d_%H%M%S}")
+    with open(base + ".html", "w", encoding="utf-8") as f:
+        f.write(html)
+    profile = os.path.join(tempfile.gettempdir(), "bot_svg_edge")
+    subprocess.run([EDGE, "--headless=new", "--disable-gpu", f"--user-data-dir={profile}", "--no-pdf-header-footer",
+                    f"--print-to-pdf={base}.pdf", "file:///" + base + ".html"],
+                   capture_output=True, timeout=90, creationflags=0x08000000)
+    for _ in range(60):   # 啟動器會先結束，PDF 稍後才寫出
+        if os.path.exists(base + ".pdf"):
+            time.sleep(0.5)
+            break
+        time.sleep(0.5)
+    os.remove(base + ".html")
+    if not os.path.exists(base + ".pdf"):
+        raise RuntimeError("PDF 轉檔失敗")
+    return base + ".pdf"
+
+
+async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool = False) -> str:
     """預估會很久（長篇工作）就直接交給 Claude；否則先用本機模型，超過 TAKEOVER_SECONDS 讓 Claude 同時接手，
     誰先完成用誰。Claude 不能用（未登入等）就照常等本機模型。"""
     if not find_claude():
@@ -1954,9 +1984,11 @@ async def answer_with_takeover(message, prompt: str, local_call) -> str:
     if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
         return local.result()
     await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
-    remote = asyncio.ensure_future(asyncio.to_thread(claude_ask, prompt + "\n\n請用繁體中文回答。"))
+    remote = asyncio.ensure_future(asyncio.to_thread(claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
+        if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
+            return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, remote.result())
         return "🧠 （由 Claude 接手完成）\n" + remote.result()
     if remote.done():
         await message.channel.send(f"⚠️ Claude 無法接手：{str(remote.exception())[:300]}\n改由本機模型繼續處理。")
@@ -2001,23 +2033,35 @@ def claude_svg(prompt: str):
         shutil.rmtree(d, ignore_errors=True)
 
 
-ANIM_SECONDS = 15   # 4 Mbps × 15 秒 ≈ 7.5 MB，低於 Discord 10 MB 上限
+ANIM_SECONDS = 15        # 沒指定長度時的預設秒數
+ANIM_MAX_SECONDS = 600   # 錄影是即時的，最長 10 分鐘
+ANIM_BYTES = 9_000_000   # Discord 一般上傳上限 10 MB，留一點餘裕；影片越長位元率越低（畫質下降）
+ANIM_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(秒|分鐘|分|sec|s|min)(?![a-z])\s*", re.I)
 ANIM_RECORDER = """<script>addEventListener('load', () => setTimeout(() => {
   const rec = new MediaRecorder(document.querySelector('canvas').captureStream(30),
-                                {mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 4e6}), parts = [];
+                                {mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: %d}), parts = [];
   rec.ondataavailable = e => parts.push(e.data);
   rec.onstop = () => { const r = new FileReader(); r.onload = () => window.__video = r.result.split(',')[1];
                        r.readAsDataURL(new Blob(parts, {type: 'video/webm'})); };
   rec.start(); setTimeout(() => rec.stop(), %d);
-}, 300));</script>""" % (ANIM_SECONDS * 1000)
+}, 300));</script>"""
 
 
-def claude_anim(prompt: str) -> bytes:
+def parse_anim_duration(prompt: str):
+    """`!anim 30秒 描述`、`!anim 2分鐘 描述`、`!anim 45s 描述` → (秒數, 描述)；沒寫就用預設。"""
+    m = ANIM_DURATION_RE.match(prompt)
+    if not m:
+        return ANIM_SECONDS, prompt
+    sec = float(m.group(1)) * (60 if m.group(2).lower() in ("分鐘", "分", "min") else 1)
+    return max(1, min(round(sec), ANIM_MAX_SECONDS)), prompt[m.end():]
+
+
+def claude_anim(prompt: str, seconds: int = ANIM_SECONDS) -> bytes:
     """Claude 寫 canvas 程式動畫，用 Edge 無頭模式即時錄成 webm（像參考影片那樣「每一格都由程式算出來」）。"""
     from playwright.sync_api import sync_playwright
     out = claude_ask(f"請寫一個 HTML 動畫：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n"
                      f"規格：只用一個 1280x720 的 <canvas> 畫全部內容，requestAnimationFrame 依經過時間播放，"
-                     f"總長 {ANIM_SECONDS} 秒、鏡頭與畫面要持續變化；不可載入任何外部資源。只輸出完整 HTML，不要說明文字。",
+                     f"總長 {seconds} 秒（內容要撐滿整段時間）、鏡頭與畫面要持續變化；不可載入任何外部資源。只輸出完整 HTML，不要說明文字。",
                      model="sonnet", timeout=1200)   # 實測 sonnet 約 10 分鐘，品質明顯比 haiku 好
     m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", out, re.S | re.I)
     if not m or "<canvas" not in m.group(0):
@@ -2026,8 +2070,9 @@ def claude_anim(prompt: str) -> bytes:
         browser = p.chromium.launch(channel="msedge", headless=True)
         try:
             page = browser.new_page(viewport={"width": 1280, "height": 720})
-            page.set_content(m.group(0) + ANIM_RECORDER)
-            page.wait_for_function("window.__video", timeout=(ANIM_SECONDS + 60) * 1000)
+            bitrate = min(4_000_000, ANIM_BYTES * 8 // seconds)
+            page.set_content(m.group(0) + ANIM_RECORDER % (bitrate, seconds * 1000))
+            page.wait_for_function("window.__video", timeout=(seconds + 60) * 1000)
             return base64.b64decode(page.evaluate("window.__video"))
         finally:
             browser.close()
@@ -2035,11 +2080,13 @@ def claude_anim(prompt: str) -> bytes:
 
 async def handle_anim_command(message, prompt: str) -> bool:
     if not prompt:
-        await message.reply("用法：`!anim 描述`，例如 `!anim 從地球飛向火星的鏡頭`")
+        await message.reply("用法：`!anim [長度] 描述`，例如 `!anim 30秒 從地球飛向火星的鏡頭`（沒寫長度就是 15 秒）")
         return True
-    status = await message.reply(f"🎬 Claude 正在製作 {ANIM_SECONDS} 秒的程式動畫（約 10 分鐘）…")
+    seconds, prompt = parse_anim_duration(prompt)
+    note = "；超過 20 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 20 else ""
+    status = await message.reply(f"🎬 Claude 正在製作 {seconds} 秒的程式動畫（寫程式約 10 分鐘，再加上錄影 {seconds} 秒{note}）…")
     try:
-        data = await asyncio.to_thread(claude_anim, prompt)
+        data = await asyncio.to_thread(claude_anim, prompt, seconds)
         await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}", file=discord.File(io.BytesIO(data), "video.webm"))
         await status.delete()
         return True
@@ -2077,7 +2124,7 @@ async def post_long(message, text: str):
 TEAM_TURNS = 4   # 討論階段輪流發言幾次（本機先說，接著 Claude，依序輪流）
 
 
-async def team_say(message, log: list, who: str, task: str, ask: str, title: str = None) -> str:
+async def team_say(message, log: list, who: str, task: str, ask: str, title: str = None, post: bool = True) -> str:
     """讓一位組員看著目前的討論紀錄發言，貼到頻道並加入紀錄。who 是 "claude" 或 "local"。"""
     me, other = ("Claude", f"本機模型 {TEXT_MODEL}") if who == "claude" else (f"本機模型 {TEXT_MODEL}", "Claude")
     hist = "\n\n".join(f"【{n}】{t}" for n, t in log) or "（還沒有人發言）"
@@ -2085,7 +2132,8 @@ async def team_say(message, log: list, who: str, task: str, ask: str, title: str
               f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。")
     text = await (asyncio.to_thread(claude_ask, prompt) if who == "claude" else run_gpu(local_ask, prompt))
     log.append((me, text))
-    await post_long(message, f"**{title or ('🧠 ' if who == 'claude' else '💻 ') + me}**\n{text}")
+    if post:
+        await post_long(message, f"**{title or ('🧠 ' if who == 'claude' else '💻 ') + me}**\n{text}")
     return text
 
 
@@ -2114,8 +2162,12 @@ async def handle_team_command(message, task: str):
         await message.channel.send("**── 3. 互相審查 ──**")
         rv = "請審查對方剛完成的部分，指出錯誤、遺漏與可以改進的地方（200 字內）。"
         await asyncio.gather(team_say(message, log, "local", task, rv), team_say(message, log, "claude", task, rv))
-        await team_say(message, log, "claude", task, "請整合雙方的成果，採納合理的審查意見，輸出給使用者的最終答案。",
-                       title="✅ 最終結果（雙方討論後由 Claude 整合）")
+        want_pdf = bool(PDF_RE.search(task))
+        final = await team_say(message, log, "claude", task, "請整合雙方的成果，採納合理的審查意見，輸出給使用者的最終答案。"
+                               + (PDF_HINT if want_pdf else ""), title="✅ 最終結果（雙方討論後由 Claude 整合）", post=not want_pdf)
+        if want_pdf:
+            path = await asyncio.to_thread(html_to_pdf, final)
+            await message.channel.send("**✅ 最終結果（PDF，雙方討論後由 Claude 整合）**", file=discord.File(path))
     except Exception as e:
         await message.reply(f"❌ 協作失敗：{str(e)}")
 
@@ -2295,7 +2347,8 @@ async def on_message(message):
                 res = await run_gpu(agent_executor.invoke, {"input": full_user_input, "chat_history": history_text})
                 return res.get("output", "抱歉，無法回應。")
 
-            answer = await answer_with_takeover(message, f"[先前對話]\n{history_text}\n\n{full_user_input}", local_call)
+            answer = await answer_with_takeover(message, f"[先前對話]\n{history_text}\n\n{full_user_input}", local_call,
+                                         bool(PDF_RE.search(clean_input)))
             add_chat_history(message.channel.id, clean_input, answer)
 
             # 自動偵測是否生成 PDF 並轉存為 Discord 附件發送
