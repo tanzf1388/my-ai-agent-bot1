@@ -1164,7 +1164,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
         await message.reply(
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
-            "`!team 任務`　Claude 規劃與審查、本機模型執行，在頻道中顯示討論過程與最終結果\n\n"
+            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -1907,9 +1907,8 @@ async def handle_generate_command(message, kind: str, prompt: str):
 
 
 # ----------------------------------------------------------------------------
-# 7.5 !team：Claude Code（規劃/審查）＋本機模型（執行）協作
+# 7.5 !team：Claude Code 與本機模型像組員一樣討論、分工、互相審查
 # ----------------------------------------------------------------------------
-TEAM_ROUNDS = 2   # 本機模型最多做幾輪（含 Claude 要求修正的次數）
 
 
 def find_claude() -> str:
@@ -2075,30 +2074,48 @@ async def post_long(message, text: str):
         await message.channel.send(c)
 
 
+TEAM_TURNS = 4   # 討論階段輪流發言幾次（本機先說，接著 Claude，依序輪流）
+
+
+async def team_say(message, log: list, who: str, task: str, ask: str, title: str = None) -> str:
+    """讓一位組員看著目前的討論紀錄發言，貼到頻道並加入紀錄。who 是 "claude" 或 "local"。"""
+    me, other = ("Claude", f"本機模型 {TEXT_MODEL}") if who == "claude" else (f"本機模型 {TEXT_MODEL}", "Claude")
+    hist = "\n\n".join(f"【{n}】{t}" for n, t in log) or "（還沒有人發言）"
+    prompt = (f"你是{me}，和{other}是同一組的組員，地位平等，要一起完成使用者的任務。\n任務：{task}\n\n"
+              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。")
+    text = await (asyncio.to_thread(claude_ask, prompt) if who == "claude" else run_gpu(local_ask, prompt))
+    log.append((me, text))
+    await post_long(message, f"**{title or ('🧠 ' if who == 'claude' else '💻 ') + me}**\n{text}")
+    return text
+
+
 async def handle_team_command(message, task: str):
+    """Claude 與本機模型像組員一樣：各自提想法、互相回應、一起定分工、各做各的、互相審查，最後整合。"""
     if not task:
         return await message.reply("用法：`!team 任務`，例如 `!team 幫我寫一份 Python 爬蟲入門講義`")
     notice = gpu_block_notice(message)
     if notice:
         return await message.reply(notice)
-    await message.reply("🤝 Claude 規劃中，接著交給本機模型執行…")
+    await message.reply("🤝 Claude 與本機模型開始討論，過程會貼在這裡…")
+    log = []
     try:
-        plan = await asyncio.to_thread(claude_ask,
-            f"你是規劃與審查者，正和一個能力較弱的本機模型（{TEXT_MODEL}）合作完成任務。\n任務：{task}\n"
-            "請拆解任務，寫出交給本機模型的具體工作指示（它看不到這段以外的內容）。只輸出指示，使用繁體中文。")
-        await post_long(message, f"**🧠 Claude → 本機模型**\n{plan}")
-        for rnd in range(1, TEAM_ROUNDS + 1):
-            work = await run_gpu(local_ask, plan)
-            await post_long(message, f"**💻 {TEXT_MODEL}（第 {rnd} 輪）**\n{work}")
-            verdict = await asyncio.to_thread(claude_ask,
-                f"任務：{task}\n你給本機模型的指示：\n{plan}\n\n本機模型的結果：\n{work}\n\n"
-                + ("若結果需要修正，第一行只寫 REVISE，之後寫給本機模型的完整新指示；" if rnd < TEAM_ROUNDS else "")
-                + "否則請審查並修正後，整合成給使用者的最終答案。使用繁體中文。")
-            if rnd < TEAM_ROUNDS and verdict.startswith("REVISE"):
-                plan = verdict[6:].strip()
-                await post_long(message, f"**🧠 Claude 要求修正**\n{plan}")
-                continue
-            return await post_long(message, f"**✅ 最終結果**\n{verdict}")
+        await message.channel.send("**── 1. 討論 ──**")
+        for i in range(TEAM_TURNS):
+            await team_say(message, log, "local" if i % 2 == 0 else "claude", task,
+                           "請回應對方的想法：同意的地方、不同意或有疑問的地方，以及你的建議（200 字內）。" if i else
+                           "請先提出你對這個任務的理解與做法（200 字內）。")
+        await team_say(message, log, "local", task, "請根據討論提出分工：雙方各負責哪些部分，說明理由（150 字內）。")
+        await team_say(message, log, "claude", task, "請回應對方的分工提議，定下雙方都同意的最終分工，"
+                       "最後兩行固定寫成「本機負責：…」與「Claude 負責：…」（200 字內）。")
+        await message.channel.send("**── 2. 各自完成負責的部分 ──**")
+        do = "請依照最終分工，只完成你負責的部分，直接輸出成果。"
+        for who in ("local", "claude"):   # 依序做：Claude 的部分常要接在本機的成果之後（例如審校初稿）
+            await team_say(message, log, who, task, do)
+        await message.channel.send("**── 3. 互相審查 ──**")
+        rv = "請審查對方剛完成的部分，指出錯誤、遺漏與可以改進的地方（200 字內）。"
+        await asyncio.gather(team_say(message, log, "local", task, rv), team_say(message, log, "claude", task, rv))
+        await team_say(message, log, "claude", task, "請整合雙方的成果，採納合理的審查意見，輸出給使用者的最終答案。",
+                       title="✅ 最終結果（雙方討論後由 Claude 整合）")
     except Exception as e:
         await message.reply(f"❌ 協作失敗：{str(e)}")
 
