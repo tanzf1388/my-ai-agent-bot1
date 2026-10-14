@@ -1162,7 +1162,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
     if cmd == "help":
         await message.reply(
             "**💬 AI 提問**\n"
-            "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n\n"
+            "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
+            "`!team 任務`　Claude 規劃與審查、本機模型執行，在頻道中顯示討論過程與最終結果\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
@@ -1890,6 +1891,74 @@ async def handle_generate_command(message, kind: str, prompt: str):
 
 
 # ----------------------------------------------------------------------------
+# 7.5 !team：Claude Code（規劃/審查）＋本機模型（執行）協作
+# ----------------------------------------------------------------------------
+TEAM_ROUNDS = 2   # 本機模型最多做幾輪（含 Claude 要求修正的次數）
+
+
+def find_claude() -> str:
+    """找 claude CLI：環境變數 CLAUDE_CLI → PATH → Claude 桌面版內建的最新版本。"""
+    exe = getenv_user("CLAUDE_CLI") or shutil.which("claude")
+    if not exe:
+        found = glob.glob(os.path.expandvars(r"%APPDATA%\Claude\claude-code\*\*\claude.exe"))
+        exe = max(found, key=os.path.getmtime) if found else None
+    return exe
+
+
+def claude_ask(prompt: str) -> str:
+    """用本機已登入的 Claude Code 無頭模式（claude -p）回答，不需要 API key。"""
+    exe = find_claude()
+    if not exe:
+        raise RuntimeError("找不到 claude CLI，請先安裝 Claude Code")
+    r = subprocess.run([exe, "-p", "--output-format", "text"], input=prompt, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600, cwd=BASE_DIR, creationflags=0x08000000)
+    out = (r.stdout or "").strip()
+    if r.returncode or not out:
+        msg = out or (r.stderr or "").strip() or f"exit {r.returncode}"
+        if "login" in msg.lower():
+            msg += f"\n請在這台電腦開終端機執行 `\"{exe}\"`，輸入 `/login` 登入一次即可。"
+        raise RuntimeError(msg[:800])
+    return out
+
+
+def local_ask(prompt: str) -> str:
+    return strip_think(llm.invoke(prompt).content)
+
+
+async def post_long(message, text: str):
+    for c in send_chunks(text):
+        await message.channel.send(c)
+
+
+async def handle_team_command(message, task: str):
+    if not task:
+        return await message.reply("用法：`!team 任務`，例如 `!team 幫我寫一份 Python 爬蟲入門講義`")
+    notice = gpu_block_notice(message)
+    if notice:
+        return await message.reply(notice)
+    await message.reply("🤝 Claude 規劃中，接著交給本機模型執行…")
+    try:
+        plan = await asyncio.to_thread(claude_ask,
+            f"你是規劃與審查者，正和一個能力較弱的本機模型（{TEXT_MODEL}）合作完成任務。\n任務：{task}\n"
+            "請拆解任務，寫出交給本機模型的具體工作指示（它看不到這段以外的內容）。只輸出指示，使用繁體中文。")
+        await post_long(message, f"**🧠 Claude → 本機模型**\n{plan}")
+        for rnd in range(1, TEAM_ROUNDS + 1):
+            work = await run_gpu(local_ask, plan)
+            await post_long(message, f"**💻 {TEXT_MODEL}（第 {rnd} 輪）**\n{work}")
+            verdict = await asyncio.to_thread(claude_ask,
+                f"任務：{task}\n你給本機模型的指示：\n{plan}\n\n本機模型的結果：\n{work}\n\n"
+                + ("若結果需要修正，第一行只寫 REVISE，之後寫給本機模型的完整新指示；" if rnd < TEAM_ROUNDS else "")
+                + "否則請審查並修正後，整合成給使用者的最終答案。使用繁體中文。")
+            if rnd < TEAM_ROUNDS and verdict.startswith("REVISE"):
+                plan = verdict[6:].strip()
+                await post_long(message, f"**🧠 Claude 要求修正**\n{plan}")
+                continue
+            return await post_long(message, f"**✅ 最終結果**\n{verdict}")
+    except Exception as e:
+        await message.reply(f"❌ 協作失敗：{str(e)}")
+
+
+# ----------------------------------------------------------------------------
 # 8. Discord Bot 事件處理 & 背景任務
 # ----------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -1979,7 +2048,11 @@ async def on_message(message):
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
     gen_match = re.match(r"^!(image|img|video)\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match):
+    team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
+        return
+    if team_match:
+        await handle_team_command(message, team_match.group(1).strip())
         return
     if gen_match:
         kind = "video" if gen_match.group(1).lower() == "video" else "image"
