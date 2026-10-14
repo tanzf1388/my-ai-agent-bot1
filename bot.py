@@ -83,6 +83,7 @@ import asyncio
 import threading
 import subprocess
 import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -1166,6 +1167,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!team 任務`　Claude 規劃與審查、本機模型執行，在頻道中顯示討論過程與最終結果\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
+            "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
@@ -1867,6 +1869,11 @@ async def handle_generate_command(message, kind: str, prompt: str):
     word = "影片" if kind == "video" else "圖片"
     if not prompt:
         return await message.reply(f"用法：`!{kind} 描述`，例如 `!{kind} 一隻在雨中撐傘的柴犬，電影感`")
+    # 本機要等（GPU 暫停或前面有生成工作）時，改由 Claude 用 SVG 畫；Claude 不能用才照原本流程
+    if kind == "image" and find_claude() and (guard.paused or gen_lock.locked()):
+        await message.reply("⏳ 本機生圖現在要等比較久，改由 Claude 用 SVG 繪製。")
+        if await handle_svg_command(message, prompt):
+            return
     notice = gpu_block_notice()
     if notice:
         return await message.reply(notice)
@@ -1905,10 +1912,13 @@ TEAM_ROUNDS = 2   # 本機模型最多做幾輪（含 Claude 要求修正的次�
 
 
 def find_claude() -> str:
-    """找 claude CLI：環境變數 CLAUDE_CLI → PATH → Claude 桌面版內建的最新版本。"""
+    """找 claude CLI：環境變數 CLAUDE_CLI → PATH → Claude 桌面版內建的最新版本
+    （桌面版是 Microsoft Store 套件，實際檔案在 Packages\\Claude_*\\LocalCache 底下）。"""
     exe = getenv_user("CLAUDE_CLI") or shutil.which("claude")
     if not exe:
-        found = glob.glob(os.path.expandvars(r"%APPDATA%\Claude\claude-code\*\*\claude.exe"))
+        found = [p for pat in (r"%APPDATA%\Claude\claude-code\*\*\claude.exe",
+                               r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\*\*\claude.exe")
+                 for p in glob.glob(os.path.expandvars(pat))]
         exe = max(found, key=os.path.getmtime) if found else None
     return exe
 
@@ -1949,6 +1959,55 @@ async def answer_with_takeover(message, prompt: str, local_call) -> str:
     if remote.done():
         await message.channel.send(f"⚠️ Claude 無法接手：{str(remote.exception())[:300]}\n改由本機模型繼續處理。")
     return await (local or local_call())
+
+
+EDGE = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe")
+
+
+def claude_svg(prompt: str):
+    """Claude 用 SVG 畫圖，再用 Edge 無頭模式轉成 PNG（Discord 不會預覽 SVG）。回傳 (svg, png 或 None)。"""
+    out = claude_ask(f"請用 SVG 畫出：{prompt}\n只輸出一個完整的 <svg> 元素（含 xmlns 與 viewBox），不要任何說明文字或程式碼框。")
+    m = re.search(r"<svg\b.*</svg>", out, re.S)
+    if not m:
+        raise RuntimeError("Claude 沒有回傳 SVG")
+    svg = m.group(0)
+    vb = re.search(r'viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)', svg)
+    w, h = (float(vb.group(1)), float(vb.group(2))) if vb else (1, 1)
+    d = tempfile.mkdtemp()
+    try:
+        html, png = os.path.join(d, "a.html"), os.path.join(d, "a.png")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<meta charset='utf-8'><style>html,body{margin:0}svg{display:block;width:100vw;height:100vh}</style>" + svg)
+        if os.path.exists(EDGE):
+            profile = os.path.join(tempfile.gettempdir(), "bot_svg_edge")   # 獨立設定檔，才不會交給已開啟的 Edge
+            subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--hide-scrollbars", f"--user-data-dir={profile}",
+                            f"--screenshot={png}", f"--window-size=1024,{max(1, round(1024 * h / w))}", "file:///" + html],
+                           capture_output=True, timeout=90, creationflags=0x08000000)
+            for _ in range(60):   # 啟動器會先結束，截圖稍後才寫出
+                if os.path.exists(png):
+                    time.sleep(0.5)
+                    break
+                time.sleep(0.5)
+        return svg, (open(png, "rb").read() if os.path.exists(png) else None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def handle_svg_command(message, prompt: str) -> bool:
+    if not prompt:
+        await message.reply("用法：`!svg 描述`，例如 `!svg 夜空下的台北 101，扁平插畫風`")
+        return True
+    status = await message.reply("✏️ Claude 正在用 SVG 繪製…")
+    try:
+        svg, png = await asyncio.to_thread(claude_svg, prompt)
+        files = [discord.File(io.BytesIO(png), "image.png")] if png else []
+        files.append(discord.File(io.BytesIO(svg.encode("utf-8")), "image.svg"))
+        await message.reply(f"✅ SVG 圖片完成（由 Claude 繪製）：{prompt[:300]}", files=files)
+        await status.delete()
+        return True
+    except Exception as e:
+        await status.edit(content=f"❌ SVG 繪製失敗：{str(e)[:500]}")
+        return False
 
 
 def local_ask(prompt: str) -> str:
@@ -2077,12 +2136,15 @@ async def on_message(message):
     is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    gen_match = re.match(r"^!(image|img|video)\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    gen_match = re.match(r"^!(image|img|video|svg)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
     if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
         return
     if team_match:
         await handle_team_command(message, team_match.group(1).strip())
+        return
+    if gen_match and gen_match.group(1).lower() == "svg":
+        await handle_svg_command(message, gen_match.group(2).strip())
         return
     if gen_match:
         kind = "video" if gen_match.group(1).lower() == "video" else "image"
