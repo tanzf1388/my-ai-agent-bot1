@@ -1258,13 +1258,12 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
 #   2. 另外讀 GPU 使用率（Windows 效能計數器，AMD/NVIDIA/Intel 都可；排除 Ollama 自己），
 #      持續偏高就視為有不在清單內的程式在用 GPU，並指出是哪個程式。
 #   3. 判定為「忙碌」→ 立刻把 Ollama 模型從顯存卸載、暫停需要模型的功能，並私訊擁有者。
-#   4. 程式關閉並穩定一小段時間後自動恢復，再通知一次。
+#   4. 連續 30 秒都沒偵測到（使用率未超過門檻、清單程式也沒執行）才自動恢復，再通知一次。
 GPU_GUARD_ENABLED = getenv_user("GPU_GUARD", "1") != "0"
 GPU_POLL_SECONDS = max(1.0, float(getenv_user("GPU_POLL_SECONDS", "3")))
-GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "85"))   # 設 0 可關閉使用率偵測
+GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "85"))   # 超過即暫停；設 0 可關閉使用率偵測
 PAUSE_AFTER_POLLS = 2          # 清單內程式連續出現 2 次（約 6 秒）才暫停，避免啟動器一閃而過
-UTIL_PAUSE_AFTER_POLLS = 5     # 只靠使用率判斷時要更保守（約 15 秒）
-RESUME_AFTER_POLLS = 10        # 連續 10 次（約 30 秒）都沒事才恢復，避免遊戲重開時反覆切換
+RESUME_AFTER_SECONDS = 30      # 連續 30 秒都沒事才恢復，避免反覆切換
 NOTIFY_USER_IDS = set(ALLOWED_USER_IDS)   # 暫停/恢復時私訊誰；預設是擁有者
 GPU_GUARD_FILE = os.path.abspath("./gpu_guard.json")
 
@@ -1476,7 +1475,7 @@ class GpuGuard:
         self.since = None
         self.busy = 0                  # Bot 自己正在跑的 GPU 工作數（只在事件迴圈執行緒修改）
         self.hot_polls = 0
-        self.clear_polls = 0
+        self.last_hot = 0.0            # 最後一次偵測到忙碌的時間（time.monotonic）
         self.tick = 0
         self.override = set()          # 擁有者手動恢復時，暫時忽略這些正在執行的程式
         self.util_ignore = False
@@ -1485,13 +1484,14 @@ class GpuGuard:
         self.top_app = None            # 使用率偏高時，佔用最多的程式
         self.util_source = None        # 使用率資料來源
 
-    def step(self, triggers: set, util):
-        """餵入一次偵測結果，回傳 'pause' / 'resume' / None。"""
+    def step(self, triggers: set, util, now=None):
+        """餵入一次偵測結果，回傳 'pause' / 'resume' / None。now 可指定時間方便測試。"""
+        now = time.monotonic() if now is None else now
         self.tick += 1
         self.last_triggers, self.last_util = set(triggers), util
         if not triggers:
             self.override.clear()
-        raw_util_hot = GPU_UTIL_THRESHOLD > 0 and util is not None and util >= GPU_UTIL_THRESHOLD
+        raw_util_hot = GPU_UTIL_THRESHOLD > 0 and util is not None and util > GPU_UTIL_THRESHOLD
         if self.util_ignore and not raw_util_hot:
             self.util_ignore = False
         if not self.enabled or self.manual:
@@ -1506,22 +1506,20 @@ class GpuGuard:
 
         if hot:
             self.hot_polls += 1
-            self.clear_polls = 0
+            self.last_hot = now
             if effective:
                 self.reason = "偵測到「" + "、".join(sorted(effective)) + "」正在執行"
             else:
                 who = f"，主要來自「{self.top_app}」" if self.top_app else ""
                 self.reason = f"GPU 使用率偏高（{util:.0f}%{who}）"
         else:
-            self.clear_polls += 1
             self.hot_polls = 0
 
         if not self.paused:
-            need = PAUSE_AFTER_POLLS if effective else UTIL_PAUSE_AFTER_POLLS
-            if hot and self.hot_polls >= need:
+            if util_hot or self.hot_polls >= PAUSE_AFTER_POLLS:   # 使用率超過門檻立即暫停
                 self.paused, self.since = True, datetime.now()
                 return "pause"
-        elif self.clear_polls >= RESUME_AFTER_POLLS:
+        elif now - self.last_hot >= RESUME_AFTER_SECONDS:
             self.paused = False
             return "resume"
         return None
@@ -1536,7 +1534,7 @@ class GpuGuard:
         self.manual = self.paused = False
         self.override = set(self.last_triggers)
         self.util_ignore = True
-        self.hot_polls = self.clear_polls = 0
+        self.hot_polls = 0
         return was
 
     def paused_for(self) -> str:
@@ -1557,7 +1555,7 @@ def gpu_block_notice(message=None):
     """暫停中就回傳要給使用者看的說明（並把訊息排入恢復後補回覆的佇列）；沒暫停回傳 None。"""
     if not guard.paused:
         return None
-    tail = "擁有者輸入 `!gpu resume` 後才會恢復" if guard.manual else f"程式關閉後約 {int(RESUME_AFTER_POLLS * GPU_POLL_SECONDS)} 秒會自動恢復"
+    tail = "擁有者輸入 `!gpu resume` 後才會恢復" if guard.manual else f"連續 {RESUME_AFTER_SECONDS} 秒沒偵測到就會自動恢復"
     queued = ""
     if message and (message.id in pending_requests or len(pending_requests) < MAX_PENDING):
         pending_requests[message.id] = message
@@ -1600,7 +1598,7 @@ async def notify_owners(text: str):
 def pause_text(unloaded: int) -> str:
     mem = f"已把 {unloaded} 個模型從顯示卡記憶體卸載，" if unloaded else ""
     return (f"⏸️ **已暫停使用 GPU**\n原因：{guard.reason}\n{mem}期間 AI 對話與圖片識別暫停，其他人傳訊息時我會說明原因，恢復後自動補回覆。\n"
-            f"程式關閉後約 {int(RESUME_AFTER_POLLS * GPU_POLL_SECONDS)} 秒會自動恢復；也可輸入 `!gpu resume` 手動恢復。")
+            f"連續 {RESUME_AFTER_SECONDS} 秒沒偵測到就會自動恢復；也可輸入 `!gpu resume` 手動恢復。")
 
 
 def gpu_status_text() -> str:
