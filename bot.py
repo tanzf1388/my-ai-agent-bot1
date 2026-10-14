@@ -1929,6 +1929,28 @@ def claude_ask(prompt: str) -> str:
     return out
 
 
+TAKEOVER_SECONDS = float(getenv_user("TAKEOVER_SECONDS", "60"))   # 本機模型超過幾秒還沒好就讓 Claude 接手
+LONG_TASK_RE = re.compile(r"長篇|詳細|完整|報告|講義|企劃|論文|教學|全文|\d{3,}\s*字")
+
+
+async def answer_with_takeover(message, prompt: str, local_call) -> str:
+    """預估會很久（長篇工作）就直接交給 Claude；否則先用本機模型，超過 TAKEOVER_SECONDS 讓 Claude 同時接手，
+    誰先完成用誰。Claude 不能用（未登入等）就照常等本機模型。"""
+    if not find_claude():
+        return await local_call()
+    local = None if LONG_TASK_RE.search(prompt) else asyncio.ensure_future(local_call())
+    if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
+        return local.result()
+    await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
+    remote = asyncio.ensure_future(asyncio.to_thread(claude_ask, prompt + "\n\n請用繁體中文回答。"))
+    done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
+    if remote in done and not remote.exception():
+        return "🧠 （由 Claude 接手完成）\n" + remote.result()
+    if remote.done():
+        await message.channel.send(f"⚠️ Claude 無法接手：{str(remote.exception())[:300]}\n改由本機模型繼續處理。")
+    return await (local or local_call())
+
+
 def local_ask(prompt: str) -> str:
     return strip_think(llm.invoke(prompt).content)
 
@@ -2134,15 +2156,11 @@ async def on_message(message):
             history_text = format_chat_history(message.channel.id)
             full_user_input = f"{reply_context}{clean_input}"
 
-            res = await run_gpu(
-                agent_executor.invoke,
-                {
-                    "input": full_user_input,
-                    "chat_history": history_text
-                }
-            )
+            async def local_call():
+                res = await run_gpu(agent_executor.invoke, {"input": full_user_input, "chat_history": history_text})
+                return res.get("output", "抱歉，無法回應。")
 
-            answer = res.get("output", "抱歉，無法回應。")
+            answer = await answer_with_takeover(message, f"[先前對話]\n{history_text}\n\n{full_user_input}", local_call)
             add_chat_history(message.channel.id, clean_input, answer)
 
             # 自動偵測是否生成 PDF 並轉存為 Discord 附件發送
