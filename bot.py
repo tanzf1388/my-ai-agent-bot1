@@ -1261,7 +1261,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
 #   4. 連續 30 秒都沒偵測到（使用率未超過門檻、清單程式也沒執行）才自動恢復，再通知一次。
 GPU_GUARD_ENABLED = getenv_user("GPU_GUARD", "1") != "0"
 GPU_POLL_SECONDS = max(1.0, float(getenv_user("GPU_POLL_SECONDS", "3")))
-GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "85"))   # 超過即暫停；設 0 可關閉使用率偵測
+GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "75"))   # 超過即暫停；設 0 可關閉使用率偵測
 PAUSE_AFTER_POLLS = 2          # 清單內程式連續出現 2 次（約 6 秒）才暫停，避免啟動器一閃而過
 RESUME_AFTER_SECONDS = 30      # 連續 30 秒都沒事才恢復，避免反覆切換
 NOTIFY_USER_IDS = set(ALLOWED_USER_IDS)   # 暫停/恢復時私訊誰；預設是擁有者
