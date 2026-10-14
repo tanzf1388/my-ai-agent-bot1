@@ -1168,7 +1168,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
-            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
+            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
+            "`!anim 描述`　由 Claude 寫程式動畫並錄成 15 秒影片（約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1870,9 +1871,9 @@ async def handle_generate_command(message, kind: str, prompt: str):
     if not prompt:
         return await message.reply(f"用法：`!{kind} 描述`，例如 `!{kind} 一隻在雨中撐傘的柴犬，電影感`")
     # 本機要等（GPU 暫停或前面有生成工作）時，改由 Claude 用 SVG 畫；Claude 不能用才照原本流程
-    if kind == "image" and find_claude() and (guard.paused or gen_lock.locked()):
-        await message.reply("⏳ 本機生圖現在要等比較久，改由 Claude 用 SVG 繪製。")
-        if await handle_svg_command(message, prompt):
+    if find_claude() and (guard.paused or gen_lock.locked()):
+        await message.reply(f"⏳ 本機生成現在要等比較久，改由 Claude {'用 SVG 繪製' if kind == 'image' else '製作程式動畫'}。")
+        if await (handle_svg_command if kind == "image" else handle_anim_command)(message, prompt):
             return
     notice = gpu_block_notice()
     if notice:
@@ -1923,13 +1924,13 @@ def find_claude() -> str:
     return exe
 
 
-def claude_ask(prompt: str) -> str:
+def claude_ask(prompt: str, model: str = None, timeout: int = 600) -> str:
     """用本機已登入的 Claude Code 無頭模式（claude -p）回答，不需要 API key。"""
     exe = find_claude()
     if not exe:
         raise RuntimeError("找不到 claude CLI，請先安裝 Claude Code")
-    r = subprocess.run([exe, "-p", "--output-format", "text"], input=prompt, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=600, cwd=BASE_DIR, creationflags=0x08000000)
+    r = subprocess.run([exe, "-p", "--output-format", "text"] + (["--model", model] if model else []), input=prompt, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=timeout, cwd=BASE_DIR, creationflags=0x08000000)
     out = (r.stdout or "").strip()
     if r.returncode or not out:
         msg = out or (r.stderr or "").strip() or f"exit {r.returncode}"
@@ -1997,6 +1998,53 @@ def claude_svg(prompt: str):
         return svg, (open(png, "rb").read() if os.path.exists(png) else None)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+ANIM_SECONDS = 15   # 4 Mbps × 15 秒 ≈ 7.5 MB，低於 Discord 10 MB 上限
+ANIM_RECORDER = """<script>addEventListener('load', () => setTimeout(() => {
+  const rec = new MediaRecorder(document.querySelector('canvas').captureStream(30),
+                                {mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 4e6}), parts = [];
+  rec.ondataavailable = e => parts.push(e.data);
+  rec.onstop = () => { const r = new FileReader(); r.onload = () => window.__video = r.result.split(',')[1];
+                       r.readAsDataURL(new Blob(parts, {type: 'video/webm'})); };
+  rec.start(); setTimeout(() => rec.stop(), %d);
+}, 300));</script>""" % (ANIM_SECONDS * 1000)
+
+
+def claude_anim(prompt: str) -> bytes:
+    """Claude 寫 canvas 程式動畫，用 Edge 無頭模式即時錄成 webm（像參考影片那樣「每一格都由程式算出來」）。"""
+    from playwright.sync_api import sync_playwright
+    out = claude_ask(f"請寫一個 HTML 動畫：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n"
+                     f"規格：只用一個 1280x720 的 <canvas> 畫全部內容，requestAnimationFrame 依經過時間播放，"
+                     f"總長 {ANIM_SECONDS} 秒、鏡頭與畫面要持續變化；不可載入任何外部資源。只輸出完整 HTML，不要說明文字。",
+                     model="sonnet", timeout=1200)   # 實測 sonnet 約 10 分鐘，品質明顯比 haiku 好
+    m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", out, re.S | re.I)
+    if not m or "<canvas" not in m.group(0):
+        raise RuntimeError("Claude 沒有回傳 canvas 動畫")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(channel="msedge", headless=True)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.set_content(m.group(0) + ANIM_RECORDER)
+            page.wait_for_function("window.__video", timeout=(ANIM_SECONDS + 60) * 1000)
+            return base64.b64decode(page.evaluate("window.__video"))
+        finally:
+            browser.close()
+
+
+async def handle_anim_command(message, prompt: str) -> bool:
+    if not prompt:
+        await message.reply("用法：`!anim 描述`，例如 `!anim 從地球飛向火星的鏡頭`")
+        return True
+    status = await message.reply(f"🎬 Claude 正在製作 {ANIM_SECONDS} 秒的程式動畫（約 10 分鐘）…")
+    try:
+        data = await asyncio.to_thread(claude_anim, prompt)
+        await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}", file=discord.File(io.BytesIO(data), "video.webm"))
+        await status.delete()
+        return True
+    except Exception as e:
+        await status.edit(content=f"❌ 動畫製作失敗：{str(e)[:500]}")
+        return False
 
 
 async def handle_svg_command(message, prompt: str) -> bool:
@@ -2142,15 +2190,15 @@ async def on_message(message):
     is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    gen_match = re.match(r"^!(image|img|video|svg)\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
     if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
         return
     if team_match:
         await handle_team_command(message, team_match.group(1).strip())
         return
-    if gen_match and gen_match.group(1).lower() == "svg":
-        await handle_svg_command(message, gen_match.group(2).strip())
+    if gen_match and gen_match.group(1).lower() in ("svg", "anim"):
+        await (handle_svg_command if gen_match.group(1).lower() == "svg" else handle_anim_command)(message, gen_match.group(2).strip())
         return
     if gen_match:
         kind = "video" if gen_match.group(1).lower() == "video" else "image"
