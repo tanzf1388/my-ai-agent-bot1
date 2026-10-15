@@ -2015,14 +2015,26 @@ def html_to_pdf(text: str) -> str:
     return base + ".pdf"
 
 
-async def claude_for(message, prompt: str) -> str:
-    """依發問者套用安全版權限執行 Claude：擁有者可上網＋在 claude_outputs 讀寫檔（新檔自動附上），其他人只能上網。"""
+async def claude_for(message, prompt: str, images=()) -> str:
+    """依發問者套用安全版權限執行 Claude：擁有者可上網＋在 claude_outputs 讀寫檔（新檔自動附上），其他人只能上網。
+    附圖（base64）會存進 Claude 的工作資料夾讓它用 Read 看；其他人另開暫存資料夾，只能讀自己傳的圖。"""
     owner = message.author.id in ALLOWED_USER_IDS
     os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+    cwd = CLAUDE_OUT_DIR if owner else tempfile.mkdtemp(prefix="bot_img_") if images else BASE_DIR
+    if images:
+        sub = f"input_{datetime.now():%Y%m%d_%H%M%S}" if owner else "."
+        os.makedirs(os.path.join(cwd, sub), exist_ok=True)
+        names = [f"{sub}/image{i + 1}.jpg" for i in range(len(images))]
+        for n, b in zip(names, images):
+            with open(os.path.join(cwd, n), "wb") as f:
+                f.write(base64.b64decode(b))
+        prompt += "\n\n使用者附上的圖片（請用 Read 工具打開來看）：" + "、".join(names)
     before = set(os.listdir(CLAUDE_OUT_DIR))
     text = await asyncio.to_thread(
         claude_ask, prompt + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
-        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR)
+        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch" + (",Read(./**)" if images else ""), cwd)
+    if images and not owner:
+        shutil.rmtree(cwd, ignore_errors=True)
     new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
     new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
     if new:
@@ -2311,6 +2323,12 @@ async def teach_turn(message, s: dict, said: str):
     hist = "\n\n".join(f"【{n}】{t}" for n, t in s["log"][-TEACH_LOG_KEEP:]) or "（第一堂課，還沒開始）"
     want_pdf = bool(PDF_RE.search(said))
     async with message.channel.typing():
+        images, _ = await collect_images(message) if message.attachments or message.reference else ([], [])
+        if images:   # 學生傳作業照片：助教（本機視覺模型）先抄錄，老師再親自看圖批改
+            seen = "" if guard.paused or gen_lock.locked() else await run_gpu(
+                vision_chat, images, "請完整抄錄圖片中的文字、算式與手寫作答（看不清楚的地方標明），不要解題也不要評論。")
+            said += f"\n（學生附上 {len(images)} 張圖片" + (
+                f"；助教初步辨識如下，可能有誤，請以圖片為準：\n{seen}" if seen and not seen.startswith("❌") else "") + "）"
         draft = await teach_assist(s, hist, said)
         p = (f"你是一位專業的{s['subject']}老師，學生程度：{s['level']}。整堂課由你主導：規劃課程、循序講解、"
              "出題確認理解、批改學生的回答並說明對錯原因，再依學生表現調整進度與難度。直接對學生說話，使用繁體中文；"
@@ -2324,7 +2342,7 @@ async def teach_turn(message, s: dict, said: str):
              f"如果這次內容涉及{s['subject']}以外的科目，另外再附上 <進度 科目=\"科目名稱\">…</進度>，"
              "寫這次教到的該科內容重點與學生情況，機器人會存進那個科目的獨立紀錄。")
         try:
-            text = await claude_for(message, p) if find_claude() else await run_gpu(local_ask, p)
+            text = await claude_for(message, p, images) if find_claude() else await run_gpu(local_ask, p)
         except Exception as e:
             if guard.paused:
                 return await message.reply(f"❌ 老師暫時無法回覆：{str(e)[:300]}")
@@ -2455,9 +2473,9 @@ async def on_message(message):
         await handle_quiz_answer(message, session, clean_input)
         return
     teach = teach_sessions.get(key)
-    if teach and not is_command and clean_input:   # 上課中：同頻道直接打字就是發問或作答
+    if teach and not is_command and (clean_input or message.attachments):   # 上課中：同頻道直接打字或傳圖就是發問或作答
         try:
-            await teach_turn(message, teach, clean_input)
+            await teach_turn(message, teach, clean_input or "（學生傳了圖片）")
         except Exception as e:
             await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
         return
