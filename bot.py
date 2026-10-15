@@ -1199,7 +1199,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
             "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n"
-            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 下一首`；只會開網址、搜尋、開常用程式、按媒體鍵，不會執行任何指令\n\n"
+            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 開 Steam`、`!pc 下一首`；只會開網址、搜尋、開已安裝的程式、按媒體鍵，不會執行任何指令\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2402,8 +2402,32 @@ PC_KEYS = {"play": (0xB3, r"暫停|播放|繼續|play|pause"), "next": (0xB0, r"
            "voldown": (0xAE, r"小聲|調低|音量\s*(減|-)|volume down")}
 PC_PROMPT = """把使用者對電腦的要求轉成 JSON 陣列（最多 3 步），只輸出 JSON。每步是 {{"action": 動作, "arg": 參數}}，動作只能是：
 url（開網址，arg 是網址）、google（Google 搜尋，arg 是關鍵字）、youtube（YouTube 搜尋，arg 是關鍵字，空字串就是開首頁）、
-app（開程式，arg 只能是 %s）、key（媒體鍵，arg 只能是 %s）。做不到就輸出 []。
+app（開程式，arg 是程式名稱，例如 %s 或任何已安裝的 App 名稱）、key（媒體鍵，arg 只能是 %s）。做不到就輸出 []。
 要求：{req}""" % ("/".join(PC_APPS), "/".join(PC_KEYS))
+_start_apps = {}   # 開始功能表裡已安裝的 App：名稱 → AppID
+
+
+def pc_find_app(name: str, refresh: bool = True):
+    """依名稱找可開的程式（語音也共用）：先看常用別名，再模糊比對開始功能表裡已安裝的 App（找不到會重新掃一次，
+    新裝的程式也找得到）。回傳 (名稱, 開啟目標)，找不到回傳 None。只會開已安裝的 App，不帶任何參數。"""
+    n = name.lower().strip()
+    for app, words in PC_APP_WORDS.items():
+        if re.search(words, n):
+            return app, PC_APPS[app]
+    for scan in (not _start_apps, refresh and bool(_start_apps)):
+        if scan:
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                                "Get-StartApps | ConvertTo-Json -Compress"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", creationflags=0x08000000)
+            _start_apps.clear()
+            _start_apps.update({a["Name"]: a["AppID"] for a in json.loads(r.stdout or "[]") if not re.search(
+                r"uninstall|解除安裝|help|說明|faq|release notes|readme|website", a["Name"], re.I)})
+        hit = (next((k for k in _start_apps if k.lower() == n), None)
+               or max((k for k in _start_apps if len(k) > 1 and k.lower() in n), key=len, default=None)
+               or min((k for k in _start_apps if len(n) > 1 and n in k.lower()), key=len, default=None))
+        if hit:
+            return hit, "shell:AppsFolder\\" + _start_apps[hit]
+    return None
 
 
 def pc_keyword_plan(text: str) -> list:
@@ -2416,15 +2440,18 @@ def pc_keyword_plan(text: str) -> list:
     url = re.search(r"https?://\S+|\b[\w-]+(\.[\w-]+)*\.(com|org|net|tw|io|tv|app)\S*", t)
     if url:
         return [{"action": "url", "arg": url.group(0)}]
-    tail = re.split(r"開啟|打開|開|open|去|進", t)[-1]   # 「在 google 開 youtube」→ 要開的是 youtube
+    tail = re.split(r"開啟|打開|啟動|開|open|去|進", t)[-1].strip()   # 「在 google 開 youtube」→ 要開的是 youtube
+    name = re.sub(r"\s*(這個|的)?\s*(app|應用程式|程式|軟體)$", "", tail).strip()
+    app = name and pc_find_app(name, refresh=False)
+    app = app and [{"action": "app", "arg": app[0]}]
+    # 明說「開 XX app/程式」或說出已安裝程式的完整名稱（Discord、GitHub Desktop）就開程式，其餘才當網站
+    if app and (name != tail or app[0]["arg"].lower() in name or app[0]["arg"] in PC_APPS):
+        return app
     for part in (tail, t):
         for site in PC_SITES:
             if site in part:
                 return [{"action": "url", "arg": site}]
-        for app, words in PC_APP_WORDS.items():
-            if re.search(words, part):
-                return [{"action": "app", "arg": app}]
-    return [{"action": "key", "arg": k} for k, (_, words) in PC_KEYS.items() if re.search(words, t)][:1]
+    return [{"action": "key", "arg": k} for k, (_, words) in PC_KEYS.items() if re.search(words, t)][:1] or app or []
 
 
 def pc_run(step: dict):
@@ -2432,9 +2459,11 @@ def pc_run(step: dict):
     import webbrowser, ctypes
     from urllib.parse import quote_plus
     a, arg = str(step.get("action", "")).lower(), str(step.get("arg") or "").strip()
-    if a == "app" and arg.lower() in PC_APPS:
-        os.startfile(PC_APPS[arg.lower()])
-        return f"🖥️ 已開啟 {arg}"
+    if a == "app":
+        app = pc_find_app(arg)
+        if app:
+            os.startfile(app[1])
+        return f"🖥️ 已開啟 {app[0]}" if app else f"🔍 找不到叫「{arg}」的程式"
     if a == "key" and arg in PC_KEYS:
         for _ in range(5 if arg.startswith("vol") else 1):   # 音量鍵一次約 2%，按 5 下
             for flag in (0, 2):
@@ -2476,7 +2505,7 @@ async def handle_pc_command(message, req: str):
         except Exception as e:
             done.append(f"❌ {step.get('arg')}：{str(e)[:200]}")
     await message.reply("\n".join(done) or "🤔 我看不懂要做什麼。目前能做：開網址、Google/YouTube 搜尋、"
-                        f"開程式（{'、'.join(PC_APPS)}）、媒體鍵（播放/暫停、上一首/下一首、音量、靜音）。")
+                        "開已安裝的程式、媒體鍵（播放/暫停、上一首/下一首、音量、靜音）。")
 
 
 # ----------------------------------------------------------------------------
