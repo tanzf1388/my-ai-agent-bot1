@@ -1924,15 +1924,22 @@ def find_claude() -> str:
     return exe
 
 
-def claude_ask(prompt: str, model: str = None, timeout: int = 600) -> str:
-    """用本機已登入的 Claude Code 無頭模式（claude -p）回答，不需要 API key。"""
+CLAUDE_OUT_DIR = os.path.join(BASE_DIR, "claude_outputs")
+# 擁有者本人：上網＋只能在 claude_outputs 資料夾裡讀寫檔（不能執行指令、碰不到其他檔案）；其他人只能上網
+OWNER_TOOLS = "WebSearch,WebFetch,Read(./**),Write(./**),Edit(./**)"
+
+
+def claude_ask(prompt: str, model: str = None, timeout: int = 600,
+               tools: str = "WebSearch,WebFetch", cwd: str = BASE_DIR) -> str:
+    """用本機已登入的 Claude Code 無頭模式（claude -p）回答，不需要 API key。只開放 tools 列出的工具。"""
     exe = find_claude()
     if not exe:
         raise RuntimeError("找不到 claude CLI，請先安裝 Claude Code")
-    # 只開放唯讀的網路搜尋與讀取網頁，讓 Claude 能查最新資料；其他工具（改檔、執行指令）一律不開
-    r = subprocess.run([exe, "-p", "--output-format", "text", "--allowedTools", "WebSearch,WebFetch"]
+    # 指令列一律封鎖（Claude Code 預設會放行 whoami 這類唯讀指令）
+    r = subprocess.run([exe, "-p", "--output-format", "text", "--allowedTools", tools,
+                        "--disallowedTools", "Bash,PowerShell"]
                        + (["--model", model] if model else []), input=prompt, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=timeout, cwd=BASE_DIR, creationflags=0x08000000)
+                       encoding="utf-8", errors="replace", timeout=timeout, cwd=cwd, creationflags=0x08000000)
     out = (r.stdout or "").strip()
     if r.returncode or not out:
         msg = out or (r.stderr or "").strip() or f"exit {r.returncode}"
@@ -1984,10 +1991,20 @@ async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool 
     if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
         return local.result()
     await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
-    remote = asyncio.ensure_future(asyncio.to_thread(claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")))
+    owner = message.author.id in ALLOWED_USER_IDS
+    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+    before = set(os.listdir(CLAUDE_OUT_DIR))
+    remote = asyncio.ensure_future(asyncio.to_thread(
+        claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")
+        + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
+        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
         text = remote.result()
+        new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
+        new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
+        if new:
+            await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
         if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
             return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, text)
         return "🧠 （由 Claude 接手完成）\n" + text
@@ -2065,7 +2082,32 @@ ANIM_POLISH = (   # 讓畫面更有質感、但不突兀的電影級後製要求
     "效能：靜態圖層（星空、紋理）先畫到離屏 canvas 再貼上，粒子數量控制在每格都能穩定 30fps，避免掉格。")
 
 
-def claude_anim(prompt: str, seconds: int = ANIM_SECONDS) -> bytes:
+ANIM_APP_BPS = 8_000_000   # 傳到 Claude App 時的原畫質位元率
+
+
+def publish_video_to_claude_app(data: bytes, title: str) -> str:
+    """請 Claude 用 Artifact 把影片發佈成 Claude App 裡的私人頁面（只有擁有者的帳號能開），回傳網址。"""
+    d = os.path.join(CLAUDE_OUT_DIR, f"video_{datetime.now():%Y%m%d_%H%M%S}")
+    os.makedirs(d)
+    with open(os.path.join(d, "video.webm"), "wb") as f:
+        f.write(data)
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(f"<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><meta name='viewport' "
+                f"content='width=device-width,initial-scale=1'><title>{html_lib.escape(title)}</title><style>"
+                ":root{--bg:#07080c;--fg:#e8e6e1}body{margin:0;min-height:100vh;display:grid;place-items:center;"
+                "padding:16px;box-sizing:border-box;background:var(--bg);color:var(--fg);font-family:system-ui,"
+                "'Microsoft JhengHei'}video{width:100%;max-width:1920px;border-radius:8px}</style></head><body><main>"
+                f"<video src='video.webm' controls autoplay muted loop playsinline></video><p>{html_lib.escape(title)}</p>"
+                "</main></body></html>")
+    out = claude_ask("用 Artifact 工具發佈目前資料夾的 index.html（icon 用 video），並用 files 參數把 video.webm "
+                     "一起發佈在同名路徑。不要修改任何檔案。最後只回覆發佈後的網址。", tools="Artifact,Read(./**),Skill", cwd=d)
+    m = re.search(r"https://claude\.ai/\S+", out)
+    if not m:
+        raise RuntimeError(f"傳到 Claude App 失敗（{out[:200]}），影片保存在 {d}")
+    return m.group(0).rstrip(").,>`")
+
+
+def claude_anim(prompt: str, seconds: int = ANIM_SECONDS, bitrate: int = None) -> bytes:
     """Claude 寫 canvas 程式動畫，用 Edge 無頭模式即時錄成 webm（像參考影片那樣「每一格都由程式算出來」）。"""
     from playwright.sync_api import sync_playwright
     out = claude_ask(f"請寫一個 HTML 動畫：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n"
@@ -2082,7 +2124,7 @@ def claude_anim(prompt: str, seconds: int = ANIM_SECONDS) -> bytes:
                 try:
                     page = browser.new_page(viewport={"width": 1920, "height": 1080})
                     page.on("pageerror", lambda e: errors.append(str(e)))
-                    bitrate = min(4_000_000, ANIM_BYTES * 8 // seconds)
+                    bitrate = bitrate or min(4_000_000, ANIM_BYTES * 8 // seconds)
                     page.set_content(m.group(0) + ANIM_RECORDER % (bitrate, seconds * 1000))
                     page.wait_for_function("window.__video", timeout=(seconds + 60) * 1000)
                     data = base64.b64decode(page.evaluate("window.__video"))
@@ -2103,11 +2145,19 @@ async def handle_anim_command(message, prompt: str) -> bool:
         await message.reply("用法：`!anim [長度] 描述`，例如 `!anim 30秒 從地球飛向火星的鏡頭`（沒寫長度就是 15 秒）")
         return True
     seconds, prompt = parse_anim_duration(prompt)
-    note = "；超過 18 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 18 else ""
+    # 放不進 Discord 10 MB 的長影片：擁有者的請求用原畫質傳到 Claude App；其他人降畫質塞進 Discord
+    to_app = seconds > 18 and message.author.id in ALLOWED_USER_IDS
+    note = ("；影片超過 Discord 上限，完成後會用原畫質傳到 Claude App 再貼連結" if to_app else
+            "；超過 18 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 18 else "")
     status = await message.reply(f"🎬 Claude 正在製作 {seconds} 秒的程式動畫（寫程式約 10 分鐘，再加上錄影 {seconds} 秒{note}）…")
     try:
-        data = await asyncio.to_thread(claude_anim, prompt, seconds)
-        await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}", file=discord.File(io.BytesIO(data), "video.webm"))
+        data = await asyncio.to_thread(claude_anim, prompt, seconds, ANIM_APP_BPS if to_app else None)
+        if to_app:
+            url = await asyncio.to_thread(publish_video_to_claude_app, data, prompt[:60])
+            await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}\n📺 影片 {len(data) / 1e6:.0f} MB 超過 "
+                                f"Discord 上限，已用原畫質傳到 Claude App（只有擁有者的帳號能開啟）：{url}")
+        else:
+            await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}", file=discord.File(io.BytesIO(data), "video.webm"))
         await status.delete()
         return True
     except Exception as e:
