@@ -272,9 +272,35 @@ def is_safe_url(url: str) -> bool:
         return False
 
 
+MATH_RULE = ("\n數學式不要用 LaTeX 或 $ 符號（Discord 不會顯示），改用一般人看得懂的寫法：x²、√(x+1)、×、÷、≤、π、"
+             "分數寫成 (x²+1)/2、導數寫成 dy/dx 或 f′(x)，並用文字說明式子的意思（例如「外層微分 × 內層微分」）。")
+_TEX = {r"\cdot": " × ", r"\times": "×", r"\div": "÷", r"\leq": "≤", r"\geq": "≥", r"\le": "≤", r"\ge": "≥",
+        r"\neq": "≠", r"\approx": "≈", r"\pm": "±", r"\infty": "∞", r"\pi": "π", r"\theta": "θ", r"\alpha": "α",
+        r"\beta": "β", r"\Delta": "Δ", r"\leftarrow": "←", r"\rightarrow": "→", r"\Rightarrow": "⇒", r"\to": "→",
+        r"\circ": "°", r"\prime": "′", r"\quad": " ", r"\int": "∫", r"\sum": "Σ"}
+_SUP, _SUB = str.maketrans("0123456789+-n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ"), str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+
+def delatex(text: str) -> str:
+    """保險：把漏網的常見 LaTeX 轉成一般人看得懂的寫法（金額的 $ 不動）。"""
+    wrap = lambda s: s if re.fullmatch(r"[\w′.⁰-⁹²³¹]+", s) else f"({s})"
+    t = re.sub(r"\$\$?([^$]+?)\$\$?", lambda m: m[1] if re.search(r"[\\^_{}=]", m[1]) else m[0], text)
+    t = re.sub(r"\\(?:left|right)(?![a-zA-Z])|\\displaystyle|\\[,;!]", "", t)
+    for _ in range(5):   # 由內而外處理巢狀
+        t = re.sub(r"\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}", lambda m: f"{wrap(m[1])}/{wrap(m[2])}", t)
+        t = re.sub(r"\\sqrt\{([^{}]*)\}", lambda m: "√" + wrap(m[1]), t)
+        t = re.sub(r"\\(?:boxed|text|mathrm|mathbf|operatorname)\{([^{}]*)\}", r"\1", t)
+        t = re.sub(r"\\lim_\{([^{}]*)\}", r"lim(\1) ", t)
+        t = re.sub(r"\^\{([0-9+\-n]+)\}|\^([0-9n])", lambda m: (m[1] or m[2]).translate(_SUP), t)
+        t = re.sub(r"_\{([0-9]+)\}|_([0-9])", lambda m: (m[1] or m[2]).translate(_SUB), t)
+    for k in sorted(_TEX, key=len, reverse=True):
+        t = t.replace(k, _TEX[k])
+    return re.sub(r"\\(sin|cos|tan|ln|log|lim|exp)(?![a-zA-Z])", r"\1", t)
+
+
 def send_chunks(text: str, limit: int = 1900):
     """把長文字切成 Discord 可接受的段落，盡量在換行處切開。"""
-    text = text or ""
+    text = delatex(text or "")
     chunks = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -497,6 +523,7 @@ RULES:
 7. If the history contains an image analysis result, treat it as the content of the image the user shared earlier.
 8. If the user wants a quiz or practice questions, tell them to use `!quiz 主題` (see `!help`); do not make up questions yourself.
 9. If the input contains [此使用者的學習紀錄], answer questions about their scores/weak topics from it directly without tools.
+10. Never use LaTeX or $ for math (Discord cannot render it); write plain readable math like x², √(x+1), (x²+1)/2, dy/dx and explain formulas in words.
 
 Begin!
 
@@ -797,6 +824,7 @@ def folder_material(topic: str, limit: int = 4000):
     words = topic.lower().split()
     files = list_reference_files(IMAGE_EXTS + (".txt", ".md"))
     random.shuffle(files)
+    subjects = {d.lower() for d in os.listdir(TEACH_DIR)} if os.path.isdir(TEACH_DIR) else set()
     parts, size, new_ocr = [], 0, 0
     for p in files:
         if size >= limit:
@@ -809,6 +837,9 @@ def folder_material(topic: str, limit: int = 4000):
             with open(p, encoding="utf-8", errors="ignore") as f:
                 text = f.read()
         if not all(w in (rel + text).lower() for w in words):
+            continue
+        # 主題指名某科時，只用那一科的上課紀錄（物理紀錄裡提到「化學」不會被拿去出化學題）
+        if rel.startswith("上課紀錄") and any(w in subjects and w not in rel.lower() for w in words):
             continue
         if is_img and not text:
             if new_ocr >= NEW_OCR_PER_QUIZ:
@@ -925,6 +956,7 @@ def normalize_question(q: dict):
     """驗證並整理單題；格式不合就回傳 None。選擇題會重新洗牌，避免答案總在同一個位置。"""
     if not isinstance(q, dict):
         return None
+    q = {k: [delatex(str(o)) for o in v] if isinstance(v, list) else delatex(v) if isinstance(v, str) else v for k, v in q.items()}
     question = str(q.get("question") or q.get("q") or "").strip()
     answer = str(q.get("answer") or "").strip()
     explain = str(q.get("explanation") or q.get("explain") or "").strip()
@@ -965,7 +997,7 @@ def build_quiz_prompt(topic: str, n: int, material: str, avoid: list) -> str:
         f"你是嚴謹的出題老師。{src}"
         f"請出 {n} 題，其中 {n - n_short} 題為四選一選擇題（type=mc），{n_short} 題為簡答題（type=short）。\n"
         "要求：題目難度由淺到深；選擇題恰有 4 個選項、只有 1 個正確答案、錯誤選項要合理；"
-        "簡答題的答案必須是簡短明確的詞語或一句話；每題都附 1–2 句解析；全部使用繁體中文。\n"
+        "簡答題的答案必須是簡短明確的詞語或一句話；每題都附 1–2 句解析；全部使用繁體中文。" + MATH_RULE + "\n"
         '只輸出 JSON，格式：{"questions":[{"type":"mc","question":"...","options":["...","...","...","..."],'
         '"answer":"A","explanation":"..."},{"type":"short","question":"...","answer":"...","explanation":"..."}]}'
         f"{avoid_txt}"
@@ -1165,7 +1197,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
         await message.reply(
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
-            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n\n"
+            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
+            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -1982,6 +2015,33 @@ def html_to_pdf(text: str) -> str:
     return base + ".pdf"
 
 
+async def claude_for(message, prompt: str, images=()) -> str:
+    """依發問者套用安全版權限執行 Claude：擁有者可上網＋在 claude_outputs 讀寫檔（新檔自動附上），其他人只能上網。
+    附圖（base64）會存進 Claude 的工作資料夾讓它用 Read 看；其他人另開暫存資料夾，只能讀自己傳的圖。"""
+    owner = message.author.id in ALLOWED_USER_IDS
+    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+    cwd = CLAUDE_OUT_DIR if owner else tempfile.mkdtemp(prefix="bot_img_") if images else BASE_DIR
+    if images:
+        sub = f"input_{datetime.now():%Y%m%d_%H%M%S}" if owner else "."
+        os.makedirs(os.path.join(cwd, sub), exist_ok=True)
+        names = [f"{sub}/image{i + 1}.jpg" for i in range(len(images))]
+        for n, b in zip(names, images):
+            with open(os.path.join(cwd, n), "wb") as f:
+                f.write(base64.b64decode(b))
+        prompt += "\n\n使用者附上的圖片（請用 Read 工具打開來看）：" + "、".join(names)
+    before = set(os.listdir(CLAUDE_OUT_DIR))
+    text = await asyncio.to_thread(
+        claude_ask, prompt + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
+        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch" + (",Read(./**)" if images else ""), cwd)
+    if images and not owner:
+        shutil.rmtree(cwd, ignore_errors=True)
+    new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
+    new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
+    if new:
+        await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
+    return text
+
+
 async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool = False) -> str:
     """預估會很久（長篇工作）就直接交給 Claude；否則先用本機模型，超過 TAKEOVER_SECONDS 讓 Claude 同時接手，
     誰先完成用誰。Claude 不能用（未登入等）就照常等本機模型。"""
@@ -1991,20 +2051,10 @@ async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool 
     if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
         return local.result()
     await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
-    owner = message.author.id in ALLOWED_USER_IDS
-    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
-    before = set(os.listdir(CLAUDE_OUT_DIR))
-    remote = asyncio.ensure_future(asyncio.to_thread(
-        claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")
-        + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
-        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR))
+    remote = asyncio.ensure_future(claude_for(message, prompt + "\n\n請用繁體中文回答。" + MATH_RULE + (PDF_HINT if want_pdf else "")))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
         text = remote.result()
-        new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
-        new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
-        if new:
-            await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
         if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
             return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, text)
         return "🧠 （由 Claude 接手完成）\n" + text
@@ -2199,7 +2249,7 @@ async def team_say(message, log: list, who: str, task: str, ask: str, title: str
     me, other = ("Claude", f"本機模型 {TEXT_MODEL}") if who == "claude" else (f"本機模型 {TEXT_MODEL}", "Claude")
     hist = "\n\n".join(f"【{n}】{t}" for n, t in log) or "（還沒有人發言）"
     prompt = (f"你是{me}，和{other}是同一組的組員，地位平等，要一起完成使用者的任務。\n任務：{task}\n\n"
-              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。")
+              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。{MATH_RULE}")
     text = await (asyncio.to_thread(claude_ask, prompt) if who == "claude" else run_gpu(local_ask, prompt))
     log.append((me, text))
     if post:
@@ -2240,6 +2290,101 @@ async def handle_team_command(message, task: str):
             await message.channel.send("**✅ 最終結果（PDF，雙方討論後由 Claude 整合）**", file=discord.File(path))
     except Exception as e:
         await message.reply(f"❌ 協作失敗：{str(e)}")
+
+
+# ----------------------------------------------------------------------------
+# 7.6 !teach：老師模式（Claude 當老師主導教學，本機模型當助教準備例子與練習題）
+# ----------------------------------------------------------------------------
+teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log", "progress"}，直到 !teach end
+TEACH_LOG_KEEP = 20   # 給老師看的最近課堂紀錄則數
+TEACH_DIR = os.path.join(DOCS_REF_DIR, "上課紀錄")   # 每科一個資料夾、每人一份；放在 reference_docs 裡，!quiz 同主題出題時會自動參考
+PROGRESS_RE = re.compile(r'<進度(?:\s+科目="([^"]+)")?>(.*?)</進度>', re.S)
+
+
+def teach_path(subject: str, uid: int) -> str:
+    return os.path.join(TEACH_DIR, sanitize_filename(subject), f"{uid}.md")
+
+
+async def teach_assist(s: dict, hist: str, said: str) -> str:
+    """本機模型（助教）準備例子與練習題草稿；GPU 暫停、ComfyUI 生成中或太慢就回傳空字串，改由 Claude 自己做。"""
+    if guard.paused or gen_lock.locked():
+        return ""
+    p = (f"你是{s['subject']}老師的助教，學生程度：{s['level']}。\n課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
+         "請為老師準備接下來教學用的草稿：1～2 個貼近學生生活的例子，以及 1 題練習題（附答案與簡短解析）。"
+         "只輸出草稿，300 字內，使用繁體中文。" + MATH_RULE)
+    try:
+        return await asyncio.wait_for(run_gpu(lambda: llm.invoke(p, reasoning=False).content), TAKEOVER_SECONDS)   # 關掉思考，幾秒就好
+    except Exception:
+        return ""
+
+
+async def teach_turn(message, s: dict, said: str):
+    """一輪教學：助教先備草稿，老師（Claude；沒有 Claude 時由本機模型代理）審查後回覆學生。"""
+    hist = "\n\n".join(f"【{n}】{t}" for n, t in s["log"][-TEACH_LOG_KEEP:]) or "（第一堂課，還沒開始）"
+    want_pdf = bool(PDF_RE.search(said))
+    async with message.channel.typing():
+        images, _ = await collect_images(message) if message.attachments or message.reference else ([], [])
+        if images:   # 學生傳作業照片：助教（本機視覺模型）先抄錄，老師再親自看圖批改
+            seen = "" if guard.paused or gen_lock.locked() else await run_gpu(
+                vision_chat, images, "請完整抄錄圖片中的文字、算式與手寫作答（看不清楚的地方標明），不要解題也不要評論。")
+            said += f"\n（學生附上 {len(images)} 張圖片" + (
+                f"；助教初步辨識如下，可能有誤，請以圖片為準：\n{seen}" if seen and not seen.startswith("❌") else "") + "）"
+        draft = await teach_assist(s, hist, said)
+        p = (f"你是一位專業的{s['subject']}老師，學生程度：{s['level']}。整堂課由你主導：規劃課程、循序講解、"
+             "出題確認理解、批改學生的回答並說明對錯原因，再依學生表現調整進度與難度。直接對學生說話，使用繁體中文；"
+             "講解要完整，不必刻意縮短；每次回覆的最後要問學生一個問題或出一題練習，讓學生回答。" + MATH_RULE + "\n\n"
+             f"上課進度與學生情況（存檔紀錄）：\n{s['progress'] or '（新課程，還沒有紀錄）'}\n\n"
+             f"課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
+             + (f"助教（本機模型）準備的例子與練習題草稿如下，請先審查，錯的改正或捨棄，再挑合適的使用：\n{draft}"
+                if draft else "助教目前不可用，例子與練習題請你自己準備。") + (PDF_HINT if want_pdf else "")
+             + "\n\n回覆的最後另外附上 <進度>…</進度>，寫更新後的完整上課紀錄：課程規劃與目前進度、已教內容重點"
+             "（概念、公式、例子）、學生掌握情況與弱點、下次要接著教什麼。這段不會給學生看，會存檔供下次上課與出題參考。"
+             f"如果這次內容涉及{s['subject']}以外的科目，另外再附上 <進度 科目=\"科目名稱\">…</進度>，"
+             "寫這次教到的該科內容重點與學生情況，機器人會存進那個科目的獨立紀錄。")
+        try:
+            text = await claude_for(message, p, images) if find_claude() else await run_gpu(local_ask, p)
+        except Exception as e:
+            if guard.paused:
+                return await message.reply(f"❌ 老師暫時無法回覆：{str(e)[:300]}")
+            text = await run_gpu(local_ask, p)
+    now = f"{datetime.now():%Y-%m-%d %H:%M}"
+    for subj, note in PROGRESS_RE.findall(text):   # 進度另存檔，不貼給學生；其他科目各自一份獨立紀錄（新科目自動建立）
+        path, note, main = teach_path(subj or s["subject"], message.author.id), note.strip(), subj in ("", s["subject"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w" if main else "a", encoding="utf-8") as f:   # 本科整份更新；其他科目接在後面累積
+            f.write(f"# {s['subject']}（{s['level']}）上課紀錄\n更新時間：{now}\n\n{note}\n" if main else
+                    f"\n## {now}（在{s['subject']}課中提到）\n{note}\n")
+        if main:
+            s["progress"] = note
+    text = PROGRESS_RE.sub("", text).strip()
+    s["log"] += [("學生", said), ("老師", text)]
+    if want_pdf:
+        return await message.reply("📄 講義 PDF：", file=discord.File(await asyncio.to_thread(html_to_pdf, text)))
+    await post_long(message, text + ("\n\n-# 💻 例子與練習題由本機模型協助準備，老師審查後使用" if draft else ""))
+
+
+async def handle_teach_command(message, arg: str):
+    key = (message.channel.id, message.author.id)
+    if arg.lower() in ("end", "stop", "結束"):
+        return await message.reply("👋 下課了！老師模式已結束。" if teach_sessions.pop(key, None) else "目前沒有進行中的課程。")
+    parts = arg.split(maxsplit=1)
+    if not parts:
+        s = teach_sessions.get(key)
+        return await message.reply(f"📚 上課中：**{s['subject']}**（{s['level']}），輸入 `!teach end` 下課。" if s else
+                                   "用法：`!teach 學科 程度`，例如 `!teach 物理 高一`；之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    try:
+        with open(teach_path(parts[0], message.author.id), encoding="utf-8") as f:
+            progress = f.read()
+    except OSError:
+        progress = ""
+    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": [], "progress": progress}
+    await message.reply(f"👩‍🏫 **{s['subject']}**（{s['level']}）{'接續上次進度' if progress else '課程開始'}！"
+                        "之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    try:
+        await teach_turn(message, s, "老師好，我們接續上次的進度繼續上課。" if progress else
+                         "老師好，我準備好上課了。請先說明這門課的規劃（分哪幾個單元），再開始第一單元。")
+    except Exception as e:
+        await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
 
 
 # ----------------------------------------------------------------------------
@@ -2320,11 +2465,19 @@ async def on_message(message):
         .replace(f"<@!{bot.user.id}>", "")
         .strip()
     )
+    clean_input = re.sub(r"^！", "!", clean_input)  # 全形「！」也當成指令
     is_command = clean_input.startswith("!")
 
     # 作答中：在 DM、@Bot、或同頻道直接打字都視為作答（指令除外）
     if session and not is_command and clean_input:
         await handle_quiz_answer(message, session, clean_input)
+        return
+    teach = teach_sessions.get(key)
+    if teach and not is_command and (clean_input or message.attachments):   # 上課中：同頻道直接打字或傳圖就是發問或作答
+        try:
+            await teach_turn(message, teach, clean_input or "（學生傳了圖片）")
+        except Exception as e:
+            await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
         return
 
     is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|index|help)\b", clean_input, flags=re.I))
@@ -2333,7 +2486,11 @@ async def on_message(message):
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
     gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
+    teach_match = re.match(r"^!teach\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match):
+        return
+    if teach_match:
+        await handle_teach_command(message, teach_match.group(1).strip())
         return
     if team_match:
         await handle_team_command(message, team_match.group(1).strip())
