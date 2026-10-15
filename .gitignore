@@ -12,3 +12,4 @@ learning_data.json*
 auto_model.txt
 image_text_cache.json
 gpu_state.json
+claude_outputs/
