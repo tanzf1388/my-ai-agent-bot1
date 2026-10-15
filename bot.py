@@ -83,6 +83,8 @@ import asyncio
 import threading
 import subprocess
 import shutil
+import tempfile
+import html as html_lib
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -1162,10 +1164,13 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
     if cmd == "help":
         await message.reply(
             "**💬 AI 提問**\n"
-            "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n\n"
+            "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
+            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
-            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
+            "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
+            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
+            "`!anim [長度] 描述`　由 Claude 寫程式動畫並錄成影片，例如 `!anim 30秒 星空`（預設 15 秒，最長 10 分鐘；寫程式約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1266,6 +1271,7 @@ PAUSE_AFTER_POLLS = 2          # 清單內程式連續出現 2 次（約 6 秒�
 RESUME_AFTER_SECONDS = 30      # 連續 30 秒都沒事才恢復，避免反覆切換
 NOTIFY_USER_IDS = set(ALLOWED_USER_IDS)   # 暫停/恢復時私訊誰；預設是擁有者
 GPU_GUARD_FILE = os.path.abspath("./gpu_guard.json")
+GPU_STATE_FILE = os.path.join(BASE_DIR, "gpu_state.json")
 
 
 def _app_key(name: str) -> str:
@@ -1726,6 +1732,13 @@ async def gpu_guard_task():
             await asyncio.to_thread(unload_ollama_models)   # 暫停期間若有請求讓模型又被載入，再卸載一次
     except Exception as e:
         print(f"⚠️ GPU 守護輪詢錯誤：{type(e).__name__}: {e}")
+    finally:   # 給 local_ai.py（Claude Code 分工給本機模型用）讀的狀態
+        try:
+            with open(GPU_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"time": time.time(), "paused": guard.paused, "reason": guard.reason,
+                           "generating": gen_lock.locked()}, f, ensure_ascii=False)
+        except OSError:
+            pass
 
 
 # ============================================================================
@@ -1858,6 +1871,11 @@ async def handle_generate_command(message, kind: str, prompt: str):
     word = "影片" if kind == "video" else "圖片"
     if not prompt:
         return await message.reply(f"用法：`!{kind} 描述`，例如 `!{kind} 一隻在雨中撐傘的柴犬，電影感`")
+    # 本機要等（GPU 暫停或前面有生成工作）時，改由 Claude 用 SVG 畫；Claude 不能用才照原本流程
+    if find_claude() and (guard.paused or gen_lock.locked()):
+        await message.reply(f"⏳ 本機生成現在要等比較久，改由 Claude {'用 SVG 繪製' if kind == 'image' else '製作程式動畫'}。")
+        if await (handle_svg_command if kind == "image" else handle_anim_command)(message, prompt):
+            return
     notice = gpu_block_notice()
     if notice:
         return await message.reply(notice)
@@ -1887,6 +1905,341 @@ async def handle_generate_command(message, kind: str, prompt: str):
         finally:
             await asyncio.to_thread(comfy_release)
             guard.busy -= 1
+
+
+# ----------------------------------------------------------------------------
+# 7.5 !team：Claude Code 與本機模型像組員一樣討論、分工、互相審查
+# ----------------------------------------------------------------------------
+
+
+def find_claude() -> str:
+    """找 claude CLI：環境變數 CLAUDE_CLI → PATH → Claude 桌面版內建的最新版本
+    （桌面版是 Microsoft Store 套件，實際檔案在 Packages\\Claude_*\\LocalCache 底下）。"""
+    exe = getenv_user("CLAUDE_CLI") or shutil.which("claude")
+    if not exe:
+        found = [p for pat in (r"%APPDATA%\Claude\claude-code\*\*\claude.exe",
+                               r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\*\*\claude.exe")
+                 for p in glob.glob(os.path.expandvars(pat))]
+        exe = max(found, key=os.path.getmtime) if found else None
+    return exe
+
+
+CLAUDE_OUT_DIR = os.path.join(BASE_DIR, "claude_outputs")
+# 擁有者本人：上網＋只能在 claude_outputs 資料夾裡讀寫檔（不能執行指令、碰不到其他檔案）；其他人只能上網
+OWNER_TOOLS = "WebSearch,WebFetch,Read(./**),Write(./**),Edit(./**)"
+
+
+def claude_ask(prompt: str, model: str = None, timeout: int = 600,
+               tools: str = "WebSearch,WebFetch", cwd: str = BASE_DIR) -> str:
+    """用本機已登入的 Claude Code 無頭模式（claude -p）回答，不需要 API key。只開放 tools 列出的工具。"""
+    exe = find_claude()
+    if not exe:
+        raise RuntimeError("找不到 claude CLI，請先安裝 Claude Code")
+    # 指令列一律封鎖（Claude Code 預設會放行 whoami 這類唯讀指令）
+    r = subprocess.run([exe, "-p", "--output-format", "text", "--allowedTools", tools,
+                        "--disallowedTools", "Bash,PowerShell"]
+                       + (["--model", model] if model else []), input=prompt, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=timeout, cwd=cwd, creationflags=0x08000000)
+    out = (r.stdout or "").strip()
+    if r.returncode or not out:
+        msg = out or (r.stderr or "").strip() or f"exit {r.returncode}"
+        if "login" in msg.lower():
+            msg += f"\n請在這台電腦開終端機執行 `\"{exe}\"`，輸入 `/login` 登入一次即可。"
+        raise RuntimeError(msg[:800])
+    return out
+
+
+TAKEOVER_SECONDS = float(getenv_user("TAKEOVER_SECONDS", "60"))   # 本機模型超過幾秒還沒好就讓 Claude 接手
+LONG_TASK_RE = re.compile(r"長篇|詳細|完整|報告|講義|企劃|論文|教學|全文|\d{3,}\s*字")
+
+
+PDF_RE = re.compile(r"pdf", re.I)
+PDF_HINT = ("\n\n使用者要的是 PDF：不要自己建立檔案，"
+            "請把完整內容輸出成一份完整的 HTML 文件（含 <style>，A4 版面、字型用 Microsoft JhengHei），機器人會自動轉成 PDF。")
+
+
+def html_to_pdf(text: str) -> str:
+    """把 Claude 輸出的 HTML（不是 HTML 就當純文字排版）用 Edge 無頭模式印成 PDF，回傳檔案路徑。"""
+    m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", text, re.S | re.I)
+    html = m.group(0) if m else ("<meta charset='utf-8'><body style=\"font-family:'Microsoft JhengHei';"
+                                  "white-space:pre-wrap;line-height:1.7\">" + html_lib.escape(text))
+    os.makedirs(PDF_OUTPUT_DIR, exist_ok=True)
+    base = os.path.join(PDF_OUTPUT_DIR, f"claude_{datetime.now():%Y%m%d_%H%M%S}")
+    with open(base + ".html", "w", encoding="utf-8") as f:
+        f.write(html)
+    profile = os.path.join(tempfile.gettempdir(), "bot_svg_edge")
+    subprocess.run([EDGE, "--headless=new", "--disable-gpu", f"--user-data-dir={profile}", "--no-pdf-header-footer",
+                    f"--print-to-pdf={base}.pdf", "file:///" + base + ".html"],
+                   capture_output=True, timeout=90, creationflags=0x08000000)
+    for _ in range(60):   # 啟動器會先結束，PDF 稍後才寫出
+        if os.path.exists(base + ".pdf"):
+            time.sleep(0.5)
+            break
+        time.sleep(0.5)
+    os.remove(base + ".html")
+    if not os.path.exists(base + ".pdf"):
+        raise RuntimeError("PDF 轉檔失敗")
+    return base + ".pdf"
+
+
+async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool = False) -> str:
+    """預估會很久（長篇工作）就直接交給 Claude；否則先用本機模型，超過 TAKEOVER_SECONDS 讓 Claude 同時接手，
+    誰先完成用誰。Claude 不能用（未登入等）就照常等本機模型。"""
+    if not find_claude():
+        return await local_call()
+    local = None if LONG_TASK_RE.search(prompt) else asyncio.ensure_future(local_call())
+    if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
+        return local.result()
+    await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
+    owner = message.author.id in ALLOWED_USER_IDS
+    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+    before = set(os.listdir(CLAUDE_OUT_DIR))
+    remote = asyncio.ensure_future(asyncio.to_thread(
+        claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")
+        + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
+        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR))
+    done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
+    if remote in done and not remote.exception():
+        text = remote.result()
+        new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
+        new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
+        if new:
+            await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
+        if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
+            return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, text)
+        return "🧠 （由 Claude 接手完成）\n" + text
+    if remote.done():
+        await message.channel.send(f"⚠️ Claude 無法接手：{str(remote.exception())[:300]}\n改由本機模型繼續處理。")
+    return await (local or local_call())
+
+
+SVG_STYLE = (   # 預設畫風（使用者在描述中指定其他風格時以使用者為準）
+    "電影感的動態圖像風格：近黑的深色背景（可加細小星點），單一主體搭配大量留白與景深；"
+    "暖色主光源（白熱核心向金橙漸層）用 radialGradient 與 feGaussianBlur 做出柔和光暈；"
+    "主體要有立體寫實感：明暗交界、表面紋理（可用 feTurbulence）、邊緣的大氣光；"
+    "可加由細小光點與細線組成、透明度漸變的軌道或粒子環；文字低調，用大號細字半透明放在角落。"
+    "避免扁平卡通、粗黑輪廓與大面積純色塊。")
+EDGE = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe")
+
+
+def claude_svg(prompt: str):
+    """Claude 用 SVG 畫圖，再用 Edge 無頭模式轉成 PNG（Discord 不會預覽 SVG）。回傳 (svg, png 或 None)。"""
+    out = claude_ask(f"請用 SVG 畫出：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n只輸出一個完整的 <svg> 元素（含 xmlns 與 viewBox），不要任何說明文字或程式碼框。")
+    m = re.search(r"<svg\b.*</svg>", out, re.S)
+    if not m:
+        raise RuntimeError("Claude 沒有回傳 SVG")
+    svg = m.group(0)
+    vb = re.search(r'viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)', svg)
+    w, h = (float(vb.group(1)), float(vb.group(2))) if vb else (1, 1)
+    d = tempfile.mkdtemp()
+    try:
+        html, png = os.path.join(d, "a.html"), os.path.join(d, "a.png")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<meta charset='utf-8'><style>html,body{margin:0}svg{display:block;width:100vw;height:100vh}</style>" + svg)
+        if os.path.exists(EDGE):
+            profile = os.path.join(tempfile.gettempdir(), "bot_svg_edge")   # 獨立設定檔，才不會交給已開啟的 Edge
+            subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--hide-scrollbars", f"--user-data-dir={profile}",
+                            f"--screenshot={png}", f"--window-size=1024,{max(1, round(1024 * h / w))}", "file:///" + html],
+                           capture_output=True, timeout=90, creationflags=0x08000000)
+            for _ in range(60):   # 啟動器會先結束，截圖稍後才寫出
+                if os.path.exists(png):
+                    time.sleep(0.5)
+                    break
+                time.sleep(0.5)
+        return svg, (open(png, "rb").read() if os.path.exists(png) else None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+ANIM_SECONDS = 15        # 沒指定長度時的預設秒數
+ANIM_MAX_SECONDS = 600   # 錄影是即時的，最長 10 分鐘
+ANIM_BYTES = 9_000_000   # Discord 一般上傳上限 10 MB，留一點餘裕；影片越長位元率越低（畫質下降）
+ANIM_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(秒|分鐘|分|sec|s|min)(?![a-z])\s*", re.I)
+ANIM_RECORDER = """<script>addEventListener('load', () => setTimeout(() => {
+  const cv = [...document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  const rec = new MediaRecorder(cv.captureStream(30),
+                                {mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: %d}), parts = [];
+  rec.ondataavailable = e => parts.push(e.data);
+  rec.onstop = () => { const r = new FileReader(); r.onload = () => window.__video = r.result.split(',')[1];
+                       r.readAsDataURL(new Blob(parts, {type: 'video/webm'})); };
+  rec.start(); setTimeout(() => rec.stop(), %d);
+}, 300));</script>"""
+
+
+def parse_anim_duration(prompt: str):
+    """`!anim 30秒 描述`、`!anim 2分鐘 描述`、`!anim 45s 描述` → (秒數, 描述)；沒寫就用預設。"""
+    m = ANIM_DURATION_RE.match(prompt)
+    if not m:
+        return ANIM_SECONDS, prompt
+    sec = float(m.group(1)) * (60 if m.group(2).lower() in ("分鐘", "分", "min") else 1)
+    return max(1, min(round(sec), ANIM_MAX_SECONDS)), prompt[m.end():]
+
+
+ANIM_POLISH = (   # 讓畫面更有質感、但不突兀的電影級後製要求
+    "質感要求：所有鏡頭移動與轉場都用 easeInOut 緩動，場景之間用淡入淡出或連續推軌銜接，不要硬切或跳動；"
+    "用 globalCompositeOperation='lighter' 做柔和的光暈（bloom），前後景分層並模糊遠景做出景深；"
+    "加上極輕微的膠片顆粒、暗角與色調統一的調色；光點與粒子要有拖尾的動態模糊。"
+    "效能：靜態圖層（星空、紋理）先畫到離屏 canvas 再貼上，粒子數量控制在每格都能穩定 30fps，避免掉格。")
+
+
+ANIM_APP_BPS = 8_000_000   # 傳到 Claude App 時的原畫質位元率
+
+
+def publish_video_to_claude_app(data: bytes, title: str) -> str:
+    """請 Claude 用 Artifact 把影片發佈成 Claude App 裡的私人頁面（只有擁有者的帳號能開），回傳網址。"""
+    d = os.path.join(CLAUDE_OUT_DIR, f"video_{datetime.now():%Y%m%d_%H%M%S}")
+    os.makedirs(d)
+    with open(os.path.join(d, "video.webm"), "wb") as f:
+        f.write(data)
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(f"<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><meta name='viewport' "
+                f"content='width=device-width,initial-scale=1'><title>{html_lib.escape(title)}</title><style>"
+                ":root{--bg:#07080c;--fg:#e8e6e1}body{margin:0;min-height:100vh;display:grid;place-items:center;"
+                "padding:16px;box-sizing:border-box;background:var(--bg);color:var(--fg);font-family:system-ui,"
+                "'Microsoft JhengHei'}video{width:100%;max-width:1920px;border-radius:8px}</style></head><body><main>"
+                f"<video src='video.webm' controls autoplay muted loop playsinline></video><p>{html_lib.escape(title)}</p>"
+                "</main></body></html>")
+    out = claude_ask("用 Artifact 工具發佈目前資料夾的 index.html（icon 用 video），並用 files 參數把 video.webm "
+                     "一起發佈在同名路徑。不要修改任何檔案。最後只回覆發佈後的網址。", tools="Artifact,Read(./**),Skill", cwd=d)
+    m = re.search(r"https://claude\.ai/\S+", out)
+    if not m:
+        raise RuntimeError(f"傳到 Claude App 失敗（{out[:200]}），影片保存在 {d}")
+    return m.group(0).rstrip(").,>`")
+
+
+def claude_anim(prompt: str, seconds: int = ANIM_SECONDS, bitrate: int = None) -> bytes:
+    """Claude 寫 canvas 程式動畫，用 Edge 無頭模式即時錄成 webm（像參考影片那樣「每一格都由程式算出來」）。"""
+    from playwright.sync_api import sync_playwright
+    out = claude_ask(f"請寫一個 HTML 動畫：{prompt}\n除非上面指定了其他風格，請採用這個畫風：{SVG_STYLE}\n"
+                     f"規格：只用一個 1920x1080 的 <canvas> 畫全部內容，requestAnimationFrame 依經過時間播放，"
+                     f"總長 {seconds} 秒（內容要撐滿整段時間）、鏡頭與畫面要持續變化；不可載入任何外部資源。\n{ANIM_POLISH}\n"
+                     "只輸出完整 HTML，不要說明文字。",
+                     model="sonnet", timeout=1200)   # 實測 sonnet 約 10 分鐘，品質明顯比 haiku 好
+    for attempt in range(2):   # 錄不到畫面（程式出錯）就把錯誤丟回給 Claude 修一次
+        m = re.search(r"<!DOCTYPE html>.*</html>|<html.*</html>", out, re.S | re.I)
+        errors = [] if m else ["沒有回傳完整 HTML"]
+        if m:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(channel="msedge", headless=True)
+                try:
+                    page = browser.new_page(viewport={"width": 1920, "height": 1080})
+                    page.on("pageerror", lambda e: errors.append(str(e)))
+                    bitrate = bitrate or min(4_000_000, ANIM_BYTES * 8 // seconds)
+                    page.set_content(m.group(0) + ANIM_RECORDER % (bitrate, seconds * 1000))
+                    page.wait_for_function("window.__video", timeout=(seconds + 60) * 1000)
+                    data = base64.b64decode(page.evaluate("window.__video"))
+                finally:
+                    browser.close()
+            if len(data) > 50_000:
+                return data
+            errors = errors or ["錄到的畫面是空的（主 canvas 沒有更新）"]
+        if attempt == 0:
+            out = claude_ask(f"你寫的 HTML 動畫錄影失敗，錯誤：{'；'.join(errors)[:1000]}\n請修正後只輸出完整 HTML。"
+                             f"注意：錄影會抓頁面 DOM 中最大的 <canvas>，畫面必須畫在它上面。\n原始程式：\n{out}",
+                             model="sonnet", timeout=1200)
+    raise RuntimeError("動畫錄影失敗：" + "；".join(errors)[:300])
+
+
+async def handle_anim_command(message, prompt: str) -> bool:
+    if not prompt:
+        await message.reply("用法：`!anim [長度] 描述`，例如 `!anim 30秒 從地球飛向火星的鏡頭`（沒寫長度就是 15 秒）")
+        return True
+    seconds, prompt = parse_anim_duration(prompt)
+    # 放不進 Discord 10 MB 的長影片：擁有者的請求用原畫質傳到 Claude App；其他人降畫質塞進 Discord
+    to_app = seconds > 18 and message.author.id in ALLOWED_USER_IDS
+    note = ("；影片超過 Discord 上限，完成後會用原畫質傳到 Claude App 再貼連結" if to_app else
+            "；超過 18 秒會為了符合 Discord 10 MB 上限降低畫質" if seconds > 18 else "")
+    status = await message.reply(f"🎬 Claude 正在製作 {seconds} 秒的程式動畫（寫程式約 10 分鐘，再加上錄影 {seconds} 秒{note}）…")
+    try:
+        data = await asyncio.to_thread(claude_anim, prompt, seconds, ANIM_APP_BPS if to_app else None)
+        if to_app:
+            url = await asyncio.to_thread(publish_video_to_claude_app, data, prompt[:60])
+            await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}\n📺 影片 {len(data) / 1e6:.0f} MB 超過 "
+                                f"Discord 上限，已用原畫質傳到 Claude App（只有擁有者的帳號能開啟）：{url}")
+        else:
+            await message.reply(f"✅ 動畫完成（由 Claude 製作）：{prompt[:300]}", file=discord.File(io.BytesIO(data), "video.webm"))
+        await status.delete()
+        return True
+    except Exception as e:
+        await status.edit(content=f"❌ 動畫製作失敗：{str(e)[:500]}")
+        return False
+
+
+async def handle_svg_command(message, prompt: str) -> bool:
+    if not prompt:
+        await message.reply("用法：`!svg 描述`，例如 `!svg 夜空下的台北 101，扁平插畫風`")
+        return True
+    status = await message.reply("✏️ Claude 正在用 SVG 繪製…")
+    try:
+        svg, png = await asyncio.to_thread(claude_svg, prompt)
+        files = [discord.File(io.BytesIO(png), "image.png")] if png else []
+        files.append(discord.File(io.BytesIO(svg.encode("utf-8")), "image.svg"))
+        await message.reply(f"✅ SVG 圖片完成（由 Claude 繪製）：{prompt[:300]}", files=files)
+        await status.delete()
+        return True
+    except Exception as e:
+        await status.edit(content=f"❌ SVG 繪製失敗：{str(e)[:500]}")
+        return False
+
+
+def local_ask(prompt: str) -> str:
+    return strip_think(llm.invoke(prompt).content)
+
+
+async def post_long(message, text: str):
+    for c in send_chunks(text):
+        await message.channel.send(c)
+
+
+TEAM_TURNS = 4   # 討論階段輪流發言幾次（本機先說，接著 Claude，依序輪流）
+
+
+async def team_say(message, log: list, who: str, task: str, ask: str, title: str = None, post: bool = True) -> str:
+    """讓一位組員看著目前的討論紀錄發言，貼到頻道並加入紀錄。who 是 "claude" 或 "local"。"""
+    me, other = ("Claude", f"本機模型 {TEXT_MODEL}") if who == "claude" else (f"本機模型 {TEXT_MODEL}", "Claude")
+    hist = "\n\n".join(f"【{n}】{t}" for n, t in log) or "（還沒有人發言）"
+    prompt = (f"你是{me}，和{other}是同一組的組員，地位平等，要一起完成使用者的任務。\n任務：{task}\n\n"
+              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。")
+    text = await (asyncio.to_thread(claude_ask, prompt) if who == "claude" else run_gpu(local_ask, prompt))
+    log.append((me, text))
+    if post:
+        await post_long(message, f"**{title or ('🧠 ' if who == 'claude' else '💻 ') + me}**\n{text}")
+    return text
+
+
+async def handle_team_command(message, task: str):
+    """Claude 與本機模型像組員一樣：各自提想法、互相回應、一起定分工、各做各的、互相審查，最後整合。"""
+    if not task:
+        return await message.reply("用法：`!team 任務`，例如 `!team 幫我寫一份 Python 爬蟲入門講義`")
+    notice = gpu_block_notice(message)
+    if notice:
+        return await message.reply(notice)
+    await message.reply("🤝 Claude 與本機模型開始討論，過程會貼在這裡…")
+    log = []
+    try:
+        await message.channel.send("**── 1. 討論 ──**")
+        for i in range(TEAM_TURNS):
+            await team_say(message, log, "local" if i % 2 == 0 else "claude", task,
+                           "請回應對方的想法：同意的地方、不同意或有疑問的地方，以及你的建議（200 字內）。" if i else
+                           "請先提出你對這個任務的理解與做法（200 字內）。")
+        await team_say(message, log, "local", task, "請根據討論提出分工：雙方各負責哪些部分，說明理由（150 字內）。")
+        await team_say(message, log, "claude", task, "請回應對方的分工提議，定下雙方都同意的最終分工，"
+                       "最後兩行固定寫成「本機負責：…」與「Claude 負責：…」（200 字內）。")
+        await message.channel.send("**── 2. 各自完成負責的部分 ──**")
+        do = "請依照最終分工，只完成你負責的部分，直接輸出成果。"
+        for who in ("local", "claude"):   # 依序做：Claude 的部分常要接在本機的成果之後（例如審校初稿）
+            await team_say(message, log, who, task, do)
+        await message.channel.send("**── 3. 互相審查 ──**")
+        rv = "請審查對方剛完成的部分，指出錯誤、遺漏與可以改進的地方（200 字內）。"
+        await asyncio.gather(team_say(message, log, "local", task, rv), team_say(message, log, "claude", task, rv))
+        want_pdf = bool(PDF_RE.search(task))
+        final = await team_say(message, log, "claude", task, "請整合雙方的成果，採納合理的審查意見，輸出給使用者的最終答案。"
+                               + (PDF_HINT if want_pdf else ""), title="✅ 最終結果（雙方討論後由 Claude 整合）", post=not want_pdf)
+        if want_pdf:
+            path = await asyncio.to_thread(html_to_pdf, final)
+            await message.channel.send("**✅ 最終結果（PDF，雙方討論後由 Claude 整合）**", file=discord.File(path))
+    except Exception as e:
+        await message.reply(f"❌ 協作失敗：{str(e)}")
 
 
 # ----------------------------------------------------------------------------
@@ -1978,8 +2331,15 @@ async def on_message(message):
     is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    gen_match = re.match(r"^!(image|img|video)\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match):
+    gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
+        return
+    if team_match:
+        await handle_team_command(message, team_match.group(1).strip())
+        return
+    if gen_match and gen_match.group(1).lower() in ("svg", "anim"):
+        await (handle_svg_command if gen_match.group(1).lower() == "svg" else handle_anim_command)(message, gen_match.group(2).strip())
         return
     if gen_match:
         kind = "video" if gen_match.group(1).lower() == "video" else "image"
@@ -2053,15 +2413,12 @@ async def on_message(message):
             history_text = format_chat_history(message.channel.id)
             full_user_input = f"{reply_context}{clean_input}"
 
-            res = await run_gpu(
-                agent_executor.invoke,
-                {
-                    "input": full_user_input,
-                    "chat_history": history_text
-                }
-            )
+            async def local_call():
+                res = await run_gpu(agent_executor.invoke, {"input": full_user_input, "chat_history": history_text})
+                return res.get("output", "抱歉，無法回應。")
 
-            answer = res.get("output", "抱歉，無法回應。")
+            answer = await answer_with_takeover(message, f"[先前對話]\n{history_text}\n\n{full_user_input}", local_call,
+                                         bool(PDF_RE.search(clean_input)))
             add_chat_history(message.channel.id, clean_input, answer)
 
             # 自動偵測是否生成 PDF 並轉存為 Discord 附件發送
