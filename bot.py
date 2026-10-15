@@ -1163,6 +1163,9 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
         await message.reply(
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n\n"
+            "**🎨 生圖 / 生影片（ComfyUI）**\n"
+            "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
+            "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n\n"
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
@@ -1328,7 +1331,7 @@ def scan_gpu_apps(watch: set) -> set:
 
 GPU_UTIL_SAMPLE_SECONDS = 5.0   # 讀取使用率的最短間隔（啟動 PowerShell 有成本，不必每 3 秒讀一次）
 _ENGINE_RE = re.compile(r"pid_(\d+)_luid_(\S+?)_phys_\d+_eng_\d+_engtype_(.+)$", re.I)
-_AI_PROC_RE = re.compile(r"ollama|llama[-_]?server", re.I)   # Ollama 與它的推論程序（新版是 llama-server.exe）
+_AI_PROC_RE = re.compile(r"ollama|llama[-_]?server|comfyui", re.I)   # Ollama（新版推論程序是 llama-server.exe）與 ComfyUI
 _nvsmi_available = None
 _win_counters_ok = None      # None=尚未確定；True=可用；False=此電腦讀不到，改用 nvidia-smi
 _win_counter_fails = 0
@@ -1337,9 +1340,14 @@ _util_cache = {"t": 0.0, "val": (None, None, None)}
 
 def _pid_name(pid: int) -> str:
     try:
-        return psutil.Process(pid).name() if psutil else f"pid{pid}"
+        p = psutil.Process(pid)
+        name = p.name()
     except Exception:
         return f"pid{pid}"
+    try:   # ComfyUI 的 python.exe 位於 Comfy-Desktop 資料夾內，算 AI 負載而非其他程式
+        return "ComfyUI" if "comfy" in p.exe().lower() else name
+    except Exception:
+        return name
 
 
 def aggregate_gpu_engines(rows, name_of=_pid_name):
@@ -1571,6 +1579,8 @@ async def replay_pending():
 
 async def run_gpu(func, *args):
     """執行需要 GPU 的工作，並登記為 Bot 自己的負載（讓使用率偵測不會誤把自己當成別的程式）。"""
+    while gen_lock.locked():   # 正在生圖/影片：等它結束，避免 Ollama 和 ComfyUI 同時佔顯存
+        await asyncio.sleep(1)
     guard.busy += 1
     try:
         return await asyncio.to_thread(func, *args)
@@ -1705,6 +1715,8 @@ async def gpu_guard_task():
         event = guard.step(triggers, util)
         if event == "pause":
             n = await asyncio.to_thread(unload_ollama_models)
+            if gen_lock.locked():
+                await asyncio.to_thread(comfy_free, True)   # 中斷進行中的生成並釋放顯存
             print(f"⏸️ GPU 暫停：{guard.reason}")
             await notify_owners(pause_text(n))
         elif event == "resume":
@@ -1716,6 +1728,167 @@ async def gpu_guard_task():
             await asyncio.to_thread(unload_ollama_models)   # 暫停期間若有請求讓模型又被載入，再卸載一次
     except Exception as e:
         print(f"⚠️ GPU 守護輪詢錯誤：{type(e).__name__}: {e}")
+
+
+# ============================================================================
+# 🎨 ComfyUI 生圖 / 生影片（!image、!video）
+# ============================================================================
+# 呼叫本機 ComfyUI Desktop 的 HTTP API；沒在執行就以無視窗方式自動啟動。
+# 生成前卸載 Ollama 模型、生成後請 ComfyUI 釋放顯存，兩者不會同時佔用顯存。
+COMFY_URL = getenv_user("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+COMFY_HOME = os.path.expandvars(getenv_user("COMFY_HOME", r"%LOCALAPPDATA%\Comfy-Desktop"))
+COMFY_TIMEOUT = 1800   # 單次生成最長等待秒數
+# 依序為 (diffusion_models, text_encoders, vae)
+IMAGE_MODELS = ("z_image_turbo_bf16.safetensors", "qwen_3_4b.safetensors", "ae.safetensors")
+VIDEO_MODELS = ("wan2.2_ti2v_5B_fp16.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan2.2_vae.safetensors")
+VIDEO_NEGATIVE = "色调艳丽，过曝，静态，细节模糊不清，字幕，最差质量，低质量，JPEG压缩残留，丑陋的，多余的手指，畸形的，毁容的，手指融合，杂乱的背景"
+gen_lock = asyncio.Lock()   # 一次只生成一個；生成期間 Ollama 的請求會等它結束
+comfy_proc = None           # Bot 自己啟動的 ComfyUI（生成完就關閉）
+
+
+def comfy_api(path: str, payload=None, timeout: float = 10):
+    r = requests.post(COMFY_URL + path, json=payload, timeout=timeout) if payload is not None \
+        else requests.get(COMFY_URL + path, timeout=timeout)
+    if not r.ok:
+        raise RuntimeError(f"ComfyUI 回應 {r.status_code}：{r.text[:300]}")
+    return r.json() if r.content else {}
+
+
+def ensure_comfy() -> str:
+    """確認 ComfyUI 在執行，沒有就在背景啟動（最多等 3 分鐘）。正常回傳空字串，否則回傳錯誤說明。（同步）"""
+    def up():
+        try:
+            return bool(comfy_api("/system_stats", timeout=3))
+        except Exception:
+            return False
+    if up():
+        return ""
+    root = os.path.join(COMFY_HOME, "ComfyUI-Installs", "ComfyUI", "ComfyUI")
+    py = os.path.join(root, ".venv", "Scripts", "python.exe")
+    if not os.path.exists(py):
+        return f"找不到 ComfyUI（{root}）。請先開啟 ComfyUI Desktop，或設定環境變數 COMFY_URL / COMFY_HOME。"
+    global comfy_proc
+    shared = os.path.join(COMFY_HOME, "ComfyUI-Shared")
+    comfy_proc = subprocess.Popen([py, "main.py", "--listen", "127.0.0.1", "--port", str(urlparse(COMFY_URL).port or 8188),
+                      "--disable-auto-launch", "--bf16-unet", "--output-directory", os.path.join(shared, "output"),
+                      "--input-directory", os.path.join(shared, "input"), "--extra-model-paths-config",
+                      os.path.join(os.environ.get("APPDATA", ""), "Comfy Desktop", "shared_model_paths.yaml")],
+                     cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=0x08000000)   # 無視窗；--bf16-unet：AMD 上 fp16 會讓 Wan 影片溢位成全灰畫面
+    for _ in range(90):
+        time.sleep(2)
+        if up():
+            return ""
+    return "ComfyUI 啟動逾時，請手動開啟 ComfyUI Desktop 後再試。"
+
+
+def missing_models(kind: str) -> list:
+    models = VIDEO_MODELS if kind == "video" else IMAGE_MODELS
+    return [m for f, m in zip(("diffusion_models", "text_encoders", "vae"), models) if m not in comfy_api(f"/models/{f}")]
+
+
+def comfy_workflow(kind: str, prompt: str, seed: int) -> dict:
+    """API 格式工作流。圖片：Z-Image Turbo 1024²、8 步；影片：Wan 2.2 TI2V 5B 832×480、約 3 秒。"""
+    video = kind == "video"
+    unet, clip, vae = VIDEO_MODELS if video else IMAGE_MODELS
+    n = lambda cls, **inputs: {"class_type": cls, "inputs": inputs}
+    wf = {
+        "1": n("UNETLoader", unet_name=unet, weight_dtype="default"),
+        "2": n("CLIPLoader", clip_name=clip, type="wan" if video else "lumina2", device="default"),
+        "3": n("VAELoader", vae_name=vae),
+        "4": n("CLIPTextEncode", clip=["2", 0], text=prompt),
+        "5": n("CLIPTextEncode", clip=["2", 0], text=VIDEO_NEGATIVE) if video
+        else n("ConditioningZeroOut", conditioning=["4", 0]),
+        "6": n("Wan22ImageToVideoLatent", vae=["3", 0], width=832, height=480, length=73, batch_size=1) if video
+        else n("EmptySD3LatentImage", width=1024, height=1024, batch_size=1),
+        "7": n("ModelSamplingSD3", model=["1", 0], shift=8) if video else n("ModelSamplingAuraFlow", model=["1", 0], shift=3),
+        "8": n("KSampler", model=["7", 0], positive=["4", 0], negative=["5", 0], latent_image=["6", 0], seed=seed,
+               steps=20 if video else 8, cfg=5 if video else 1, sampler_name="uni_pc" if video else "res_multistep",
+               scheduler="simple", denoise=1),
+        "9": n("VAEDecode", samples=["8", 0], vae=["3", 0]),
+    }
+    if video:
+        wf["10"] = n("CreateVideo", images=["9", 0], fps=24)
+        wf["11"] = n("SaveVideo", video=["10", 0], filename_prefix="discord/video", format="mp4", codec="h264")
+    else:
+        wf["10"] = n("SaveImage", images=["9", 0], filename_prefix="discord/image")
+    return wf
+
+
+def comfy_generate(kind: str, prompt: str):
+    """送出工作流並等結果，回傳 (檔名, 檔案內容)。（同步）"""
+    pid = comfy_api("/prompt", {"prompt": comfy_workflow(kind, prompt, random.randint(0, 2**48))})["prompt_id"]
+    deadline = time.time() + COMFY_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            st = (comfy_api(f"/history/{pid}").get(pid) or {}).get("status", {})
+        except requests.RequestException:   # 載入大模型時 RAM 吃緊，連線偶爾會暫時失敗
+            continue
+        if st.get("status_str") == "error":
+            errs = [m[1].get("exception_message", "") for m in st.get("messages", []) if m[0] == "execution_error"]
+            raise RuntimeError("；".join(errs).strip() or "ComfyUI 執行失敗")
+        if st.get("completed"):
+            for out in comfy_api(f"/history/{pid}")[pid].get("outputs", {}).values():
+                for f in out.get("images", []):
+                    return f["filename"], requests.get(COMFY_URL + "/view", params=f, timeout=60).content
+            raise RuntimeError("ComfyUI 沒有輸出檔案")
+    comfy_free(True)
+    raise RuntimeError(f"超過 {COMFY_TIMEOUT // 60} 分鐘仍未完成，已中斷")
+
+
+def comfy_free(interrupt: bool = False):
+    """請 ComfyUI 卸載模型、釋放顯存（interrupt=True 會先中斷進行中的工作）。（同步）"""
+    try:
+        if interrupt:
+            comfy_api("/interrupt", {})
+        comfy_api("/free", {"unload_models": True, "free_memory": True})
+    except Exception:
+        pass
+
+
+def comfy_release():
+    """生成結束後釋放顯存。Bot 自己啟動的 ComfyUI 直接關閉：卸載模型後 ROCm 仍會佔約 2.5 GB 顯存與大量 RAM。（同步）"""
+    global comfy_proc
+    comfy_free()
+    if comfy_proc:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(comfy_proc.pid)], capture_output=True, creationflags=0x08000000)
+        comfy_proc = None
+
+
+async def handle_generate_command(message, kind: str, prompt: str):
+    word = "影片" if kind == "video" else "圖片"
+    if not prompt:
+        return await message.reply(f"用法：`!{kind} 描述`，例如 `!{kind} 一隻在雨中撐傘的柴犬，電影感`")
+    notice = gpu_block_notice()
+    if notice:
+        return await message.reply(notice)
+    status = await message.reply("🎨 前面還有生成工作，排隊中…" if gen_lock.locked() else f"🎨 正在生成{word}…")
+    async with gen_lock:
+        while guard.busy:   # 等進行中的 AI 對話用完顯存
+            await asyncio.sleep(1)
+        guard.busy += 1
+        t0 = time.monotonic()
+        try:
+            if guard.paused:   # 排隊期間 GPU 被暫停
+                return await status.edit(content=gpu_block_notice())
+            await status.edit(content=f"🎨 正在生成{word}…" + ("（影片約需 15 分鐘）" if kind == "video" else ""))
+            err = await asyncio.to_thread(ensure_comfy)
+            missing = [] if err else await asyncio.to_thread(missing_models, kind)
+            if err or missing:
+                tip = ("建議安裝 Wan 2.2 TI2V 5B（約 18 GB，16 GB 顯存可跑）：在 ComfyUI Desktop 的範本中開啟"
+                       "「Wan 2.2 5B」影片範本並下載缺少的模型。" if kind == "video" else "")
+                return await status.edit(content="❌ " + (err or f"ComfyUI 缺少{word}模型：{'、'.join(missing)}。{tip}"))
+            await asyncio.to_thread(unload_ollama_models)
+            name, data = await asyncio.to_thread(comfy_generate, kind, prompt)
+            await message.reply(f"✅ {word}完成（{time.monotonic() - t0:.0f} 秒）：{prompt[:300]}",
+                                file=discord.File(io.BytesIO(data), name))
+            await status.delete()
+        except Exception as e:
+            await status.edit(content=f"❌ {word}生成失敗：{str(e)[:500]}")
+        finally:
+            await asyncio.to_thread(comfy_release)
+            guard.busy -= 1
 
 
 # ----------------------------------------------------------------------------
@@ -1807,7 +1980,12 @@ async def on_message(message):
     is_gpu_cmd = bool(re.match(r"^!(gpu|model)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match):
+    gen_match = re.match(r"^!(image|img|video)\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match):
+        return
+    if gen_match:
+        kind = "video" if gen_match.group(1).lower() == "video" else "image"
+        await handle_generate_command(message, kind, gen_match.group(2).strip())
         return
     if is_gpu_cmd:
         handler = handle_model_command if clean_input[1:].lower().startswith("model") else handle_gpu_command
