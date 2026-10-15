@@ -1166,7 +1166,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
-            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課\n\n"
+            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2251,8 +2251,10 @@ async def handle_team_command(message, task: str):
 # ----------------------------------------------------------------------------
 # 7.6 !teach：老師模式（Claude 當老師主導教學，本機模型當助教準備例子與練習題）
 # ----------------------------------------------------------------------------
-teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log"}，直到 !teach end
+teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log", "file", "progress"}，直到 !teach end
 TEACH_LOG_KEEP = 20   # 給老師看的最近課堂紀錄則數
+TEACH_DIR = os.path.join(DOCS_REF_DIR, "上課紀錄")   # 每人每科一份進度檔；放在 reference_docs 裡，!quiz 同主題出題時會自動參考
+PROGRESS_RE = re.compile(r"<進度>(.*?)</進度>", re.S)
 
 
 async def teach_assist(s: dict, hist: str, said: str) -> str:
@@ -2277,15 +2279,24 @@ async def teach_turn(message, s: dict, said: str):
         p = (f"你是一位專業的{s['subject']}老師，學生程度：{s['level']}。整堂課由你主導：規劃課程、循序講解、"
              "出題確認理解、批改學生的回答並說明對錯原因，再依學生表現調整進度與難度。直接對學生說話，使用繁體中文；"
              "講解要完整，不必刻意縮短；每次回覆的最後要問學生一個問題或出一題練習，讓學生回答。\n\n"
+             f"上課進度與學生情況（存檔紀錄）：\n{s['progress'] or '（新課程，還沒有紀錄）'}\n\n"
              f"課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
              + (f"助教（本機模型）準備的例子與練習題草稿如下，請先審查，錯的改正或捨棄，再挑合適的使用：\n{draft}"
-                if draft else "助教目前不可用，例子與練習題請你自己準備。") + (PDF_HINT if want_pdf else ""))
+                if draft else "助教目前不可用，例子與練習題請你自己準備。") + (PDF_HINT if want_pdf else "")
+             + "\n\n回覆的最後另外附上 <進度>…</進度>，寫更新後的完整上課紀錄：課程規劃與目前進度、已教內容重點"
+             "（概念、公式、例子）、學生掌握情況與弱點、下次要接著教什麼。這段不會給學生看，會存檔供下次上課與出題參考。")
         try:
             text = await claude_for(message, p) if find_claude() else await run_gpu(local_ask, p)
         except Exception as e:
             if guard.paused:
                 return await message.reply(f"❌ 老師暫時無法回覆：{str(e)[:300]}")
             text = await run_gpu(local_ask, p)
+    m = PROGRESS_RE.search(text)
+    if m:   # 進度另存檔，不貼給學生
+        text, s["progress"] = (text[:m.start()] + text[m.end():]).strip(), m.group(1).strip()
+        os.makedirs(TEACH_DIR, exist_ok=True)
+        with open(s["file"], "w", encoding="utf-8") as f:
+            f.write(f"# {s['subject']}（{s['level']}）上課紀錄\n更新時間：{datetime.now():%Y-%m-%d %H:%M}\n\n{s['progress']}\n")
     s["log"] += [("學生", said), ("老師", text)]
     if want_pdf:
         return await message.reply("📄 講義 PDF：", file=discord.File(await asyncio.to_thread(html_to_pdf, text)))
@@ -2301,10 +2312,19 @@ async def handle_teach_command(message, arg: str):
         s = teach_sessions.get(key)
         return await message.reply(f"📚 上課中：**{s['subject']}**（{s['level']}），輸入 `!teach end` 下課。" if s else
                                    "用法：`!teach 學科 程度`，例如 `!teach 物理 高一`；之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
-    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": []}
-    await message.reply(f"👩‍🏫 **{s['subject']}**（{s['level']}）課程開始！之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    path = os.path.join(TEACH_DIR, f"{sanitize_filename(parts[0])}_{message.author.id}.md")
     try:
-        await teach_turn(message, s, "老師好，我準備好上課了。請先說明這門課的規劃（分哪幾個單元），再開始第一單元。")
+        with open(path, encoding="utf-8") as f:
+            progress = f.read()
+    except OSError:
+        progress = ""
+    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": [],
+                               "file": path, "progress": progress}
+    await message.reply(f"👩‍🏫 **{s['subject']}**（{s['level']}）{'接續上次進度' if progress else '課程開始'}！"
+                        "之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    try:
+        await teach_turn(message, s, "老師好，我們接續上次的進度繼續上課。" if progress else
+                         "老師好，我準備好上課了。請先說明這門課的規劃（分哪幾個單元），再開始第一單元。")
     except Exception as e:
         await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
 
