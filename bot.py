@@ -2263,7 +2263,7 @@ async def teach_assist(s: dict, hist: str, said: str) -> str:
          "請為老師準備接下來教學用的草稿：1～2 個貼近學生生活的例子，以及 1 題練習題（附答案與簡短解析）。"
          "只輸出草稿，300 字內，使用繁體中文。")
     try:
-        return await asyncio.wait_for(run_gpu(local_ask, p), TAKEOVER_SECONDS)
+        return await asyncio.wait_for(run_gpu(lambda: llm.invoke(p, reasoning=False).content), TAKEOVER_SECONDS)   # 關掉思考，幾秒就好
     except Exception:
         return ""
 
