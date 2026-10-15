@@ -1199,7 +1199,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
             "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n"
-            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 開 Steam`、`!pc 下一首`；只會開網址、搜尋、開已安裝的程式、按媒體鍵，不會執行任何指令\n\n"
+            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 開 Steam`、`!pc 關閉 YouTube`、`!pc 下一首`；只會開網址、搜尋、開關已安裝的程式、關網站分頁、按媒體鍵，不會執行任何指令\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2402,7 +2402,7 @@ PC_KEYS = {"play": (0xB3, r"暫停|播放|繼續|play|pause"), "next": (0xB0, r"
            "voldown": (0xAE, r"小聲|調低|音量\s*(減|-)|volume down")}
 PC_PROMPT = """把使用者對電腦的要求轉成 JSON 陣列（最多 3 步），只輸出 JSON。每步是 {{"action": 動作, "arg": 參數}}，動作只能是：
 url（開網址，arg 是網址）、google（Google 搜尋，arg 是關鍵字）、youtube（YouTube 搜尋，arg 是關鍵字，空字串就是開首頁）、
-app（開程式，arg 是程式名稱，例如 %s 或任何已安裝的 App 名稱）、key（媒體鍵，arg 只能是 %s）。做不到就輸出 []。
+app（開程式，arg 是程式名稱，例如 %s 或任何已安裝的 App 名稱）、close（關閉程式或網站分頁，arg 是名稱）、key（媒體鍵，arg 只能是 %s）。做不到就輸出 []。
 要求：{req}""" % ("/".join(PC_APPS), "/".join(PC_KEYS))
 _start_apps = {}   # 開始功能表裡已安裝的 App：名稱 → AppID
 
@@ -2430,9 +2430,55 @@ def pc_find_app(name: str, refresh: bool = True):
     return None
 
 
+PC_BROWSERS = ("chrome", "msedge", "firefox", "brave", "opera")
+
+
+def pc_close(name: str) -> str:
+    """關閉名稱相符的視窗：一般程式送 WM_CLOSE（跟按右上角 X 一樣，有未存檔會照常詢問，不強制結束）；
+    網站只關瀏覽器裡「目前顯示」的那個分頁（切到該視窗按 Ctrl+W），不會關掉整個瀏覽器。"""
+    import ctypes
+    from ctypes import wintypes
+    u, n, wins = ctypes.windll.user32, name.lower().strip(), []
+    app = n and pc_find_app(n, refresh=False)
+    keys = {k for k in (n, app and app[0].lower(), app and app[1].endswith(".exe") and app[1][:-4]) if k and len(k) > 1}
+
+    def cb(h, _):
+        size = u.GetWindowTextLengthW(h)
+        if u.IsWindowVisible(h) and size:
+            buf, pid = ctypes.create_unicode_buffer(size + 1), wintypes.DWORD()
+            u.GetWindowTextW(h, buf, size + 1)
+            u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            wins.append((h, buf.value, _pid_name(pid.value).lower().removesuffix(".exe")))
+        return True
+    u.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(cb), 0)
+    wins = [w for w in wins if w[1] != "Program Manager" and keys]   # 桌面本身不能關
+    # 程式名稱相符，或是已安裝的 App 且視窗標題相符（例如「未命名 - 小畫家」）；瀏覽器視窗不用標題比對，留給下面關分頁
+    apps = [w for w in wins if any(k in w[2] or app and k in w[1].lower() and not w[2].startswith(PC_BROWSERS) for k in keys)]
+    for h, *_ in apps:
+        u.PostMessageW(h, 0x0010, 0, 0)   # WM_CLOSE
+    if apps:
+        return f"❎ 已關閉 {app[0] if app else name}（{len(apps)} 個視窗）"
+    tab = next((w for w in wins if w[2].startswith(PC_BROWSERS)
+                and any(k in w[1].rsplit(" - ", 1)[0].lower() for k in keys)), None)   # 標題去掉「- Google Chrome」再比對
+    if not tab:
+        return f"🔍 沒找到開著的「{name}」（網站要是瀏覽器目前顯示的分頁才關得到）"
+    u.keybd_event(0x12, 0, 0, 0)   # 先按一下 Alt，Windows 才允許背景程式切換前景視窗
+    u.SetForegroundWindow(tab[0])
+    u.keybd_event(0x12, 0, 2, 0)
+    time.sleep(0.3)
+    if u.GetForegroundWindow() != tab[0]:   # 沒切成功就不按，免得關錯分頁
+        return f"⚠️ 無法切換到「{tab[1]}」，沒有關閉"
+    for vk, flag in ((0x11, 0), (0x57, 0), (0x57, 2), (0x11, 2)):   # Ctrl+W
+        u.keybd_event(vk, 0, flag, 0)
+    return f"❎ 已關閉分頁：{tab[1].rsplit(' - ', 1)[0]}"
+
+
 def pc_keyword_plan(text: str) -> list:
     """常見說法直接用關鍵字辨識（不用等模型）；辨識不出來回傳 []。"""
     t = text.lower()
+    c = re.search(r"(?:關閉|關掉|close|^關(?!小))\s*(.+)", t)
+    if c:
+        return [{"action": "close", "arg": re.sub(r"\s*(這個|的)?\s*(app|應用程式|程式|軟體|視窗|分頁)$", "", c.group(1)).strip()}]
     q = re.search(r"(?:搜尋|搜索|查詢|search|搜|找|查(?!看))\s*(.+)", t)
     q = re.sub(r"\s*(的)?(影片|video)$", "", q.group(1)).strip() if q else ""
     if q:
@@ -2469,6 +2515,8 @@ def pc_run(step: dict):
             for flag in (0, 2):
                 ctypes.windll.user32.keybd_event(PC_KEYS[arg][0], 0, flag, 0)
         return f"🎵 已按下 {arg}"
+    if a == "close" and arg:
+        return pc_close(arg)
     if a == "google":
         url = "https://www.google.com/search?q=" + quote_plus(arg)
     elif a == "youtube":
@@ -2505,7 +2553,7 @@ async def handle_pc_command(message, req: str):
         except Exception as e:
             done.append(f"❌ {step.get('arg')}：{str(e)[:200]}")
     await message.reply("\n".join(done) or "🤔 我看不懂要做什麼。目前能做：開網址、Google/YouTube 搜尋、"
-                        "開已安裝的程式、媒體鍵（播放/暫停、上一首/下一首、音量、靜音）。")
+                        "開或關已安裝的程式、關網站分頁、媒體鍵（播放/暫停、上一首/下一首、音量、靜音）。")
 
 
 # ----------------------------------------------------------------------------
