@@ -797,6 +797,7 @@ def folder_material(topic: str, limit: int = 4000):
     words = topic.lower().split()
     files = list_reference_files(IMAGE_EXTS + (".txt", ".md"))
     random.shuffle(files)
+    subjects = {d.lower() for d in os.listdir(TEACH_DIR)} if os.path.isdir(TEACH_DIR) else set()
     parts, size, new_ocr = [], 0, 0
     for p in files:
         if size >= limit:
@@ -809,6 +810,9 @@ def folder_material(topic: str, limit: int = 4000):
             with open(p, encoding="utf-8", errors="ignore") as f:
                 text = f.read()
         if not all(w in (rel + text).lower() for w in words):
+            continue
+        # 主題指名某科時，只用那一科的上課紀錄（物理紀錄裡提到「化學」不會被拿去出化學題）
+        if rel.startswith("上課紀錄") and any(w in subjects and w not in rel.lower() for w in words):
             continue
         if is_img and not text:
             if new_ocr >= NEW_OCR_PER_QUIZ:
@@ -1166,7 +1170,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
-            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n\n"
+            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2251,10 +2255,14 @@ async def handle_team_command(message, task: str):
 # ----------------------------------------------------------------------------
 # 7.6 !teach：老師模式（Claude 當老師主導教學，本機模型當助教準備例子與練習題）
 # ----------------------------------------------------------------------------
-teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log", "file", "progress"}，直到 !teach end
+teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log", "progress"}，直到 !teach end
 TEACH_LOG_KEEP = 20   # 給老師看的最近課堂紀錄則數
-TEACH_DIR = os.path.join(DOCS_REF_DIR, "上課紀錄")   # 每人每科一份進度檔；放在 reference_docs 裡，!quiz 同主題出題時會自動參考
-PROGRESS_RE = re.compile(r"<進度>(.*?)</進度>", re.S)
+TEACH_DIR = os.path.join(DOCS_REF_DIR, "上課紀錄")   # 每科一個資料夾、每人一份；放在 reference_docs 裡，!quiz 同主題出題時會自動參考
+PROGRESS_RE = re.compile(r'<進度(?:\s+科目="([^"]+)")?>(.*?)</進度>', re.S)
+
+
+def teach_path(subject: str, uid: int) -> str:
+    return os.path.join(TEACH_DIR, sanitize_filename(subject), f"{uid}.md")
 
 
 async def teach_assist(s: dict, hist: str, said: str) -> str:
@@ -2284,19 +2292,25 @@ async def teach_turn(message, s: dict, said: str):
              + (f"助教（本機模型）準備的例子與練習題草稿如下，請先審查，錯的改正或捨棄，再挑合適的使用：\n{draft}"
                 if draft else "助教目前不可用，例子與練習題請你自己準備。") + (PDF_HINT if want_pdf else "")
              + "\n\n回覆的最後另外附上 <進度>…</進度>，寫更新後的完整上課紀錄：課程規劃與目前進度、已教內容重點"
-             "（概念、公式、例子）、學生掌握情況與弱點、下次要接著教什麼。這段不會給學生看，會存檔供下次上課與出題參考。")
+             "（概念、公式、例子）、學生掌握情況與弱點、下次要接著教什麼。這段不會給學生看，會存檔供下次上課與出題參考。"
+             f"如果這次內容涉及{s['subject']}以外的科目，另外再附上 <進度 科目=\"科目名稱\">…</進度>，"
+             "寫這次教到的該科內容重點與學生情況，機器人會存進那個科目的獨立紀錄。")
         try:
             text = await claude_for(message, p) if find_claude() else await run_gpu(local_ask, p)
         except Exception as e:
             if guard.paused:
                 return await message.reply(f"❌ 老師暫時無法回覆：{str(e)[:300]}")
             text = await run_gpu(local_ask, p)
-    m = PROGRESS_RE.search(text)
-    if m:   # 進度另存檔，不貼給學生
-        text, s["progress"] = (text[:m.start()] + text[m.end():]).strip(), m.group(1).strip()
-        os.makedirs(TEACH_DIR, exist_ok=True)
-        with open(s["file"], "w", encoding="utf-8") as f:
-            f.write(f"# {s['subject']}（{s['level']}）上課紀錄\n更新時間：{datetime.now():%Y-%m-%d %H:%M}\n\n{s['progress']}\n")
+    now = f"{datetime.now():%Y-%m-%d %H:%M}"
+    for subj, note in PROGRESS_RE.findall(text):   # 進度另存檔，不貼給學生；其他科目各自一份獨立紀錄（新科目自動建立）
+        path, note, main = teach_path(subj or s["subject"], message.author.id), note.strip(), subj in ("", s["subject"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w" if main else "a", encoding="utf-8") as f:   # 本科整份更新；其他科目接在後面累積
+            f.write(f"# {s['subject']}（{s['level']}）上課紀錄\n更新時間：{now}\n\n{note}\n" if main else
+                    f"\n## {now}（在{s['subject']}課中提到）\n{note}\n")
+        if main:
+            s["progress"] = note
+    text = PROGRESS_RE.sub("", text).strip()
     s["log"] += [("學生", said), ("老師", text)]
     if want_pdf:
         return await message.reply("📄 講義 PDF：", file=discord.File(await asyncio.to_thread(html_to_pdf, text)))
@@ -2312,14 +2326,12 @@ async def handle_teach_command(message, arg: str):
         s = teach_sessions.get(key)
         return await message.reply(f"📚 上課中：**{s['subject']}**（{s['level']}），輸入 `!teach end` 下課。" if s else
                                    "用法：`!teach 學科 程度`，例如 `!teach 物理 高一`；之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
-    path = os.path.join(TEACH_DIR, f"{sanitize_filename(parts[0])}_{message.author.id}.md")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(teach_path(parts[0], message.author.id), encoding="utf-8") as f:
             progress = f.read()
     except OSError:
         progress = ""
-    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": [],
-                               "file": path, "progress": progress}
+    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": [], "progress": progress}
     await message.reply(f"👩‍🏫 **{s['subject']}**（{s['level']}）{'接續上次進度' if progress else '課程開始'}！"
                         "之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
     try:
