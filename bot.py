@@ -1198,7 +1198,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
-            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n\n"
+            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n"
+            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 下一首`；只會開網址、搜尋、開常用程式、按媒體鍵，不會執行任何指令\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2388,6 +2389,97 @@ async def handle_teach_command(message, arg: str):
 
 
 # ----------------------------------------------------------------------------
+# 7.7 !pc：擁有者用 Discord 叫電腦做事（只執行下面固定的安全動作，不開放任何指令列）
+# ----------------------------------------------------------------------------
+PC_SITES = {"youtube": "https://www.youtube.com", "google": "https://www.google.com", "gmail": "https://mail.google.com",
+            "github": "https://github.com", "facebook": "https://www.facebook.com", "instagram": "https://www.instagram.com",
+            "netflix": "https://www.netflix.com", "chatgpt": "https://chatgpt.com", "discord": "https://discord.com/app"}
+PC_APPS = {"chrome": "chrome.exe", "notepad": "notepad.exe", "calc": "calc.exe", "explorer": "explorer.exe", "spotify": "spotify:"}
+PC_APP_WORDS = {"chrome": r"chrome|瀏覽器", "notepad": r"notepad|記事本", "calc": r"calc|計算機|小算盤",
+                "explorer": r"explorer|檔案總管", "spotify": r"spotify"}
+PC_KEYS = {"play": (0xB3, r"暫停|播放|繼續|play|pause"), "next": (0xB0, r"下一首|下一個|next"), "prev": (0xB1, r"上一首|prev"),
+           "mute": (0xAD, r"靜音|mute"), "volup": (0xAF, r"大聲|調高|音量\s*(加|\+)|volume up"),
+           "voldown": (0xAE, r"小聲|調低|音量\s*(減|-)|volume down")}
+PC_PROMPT = """把使用者對電腦的要求轉成 JSON 陣列（最多 3 步），只輸出 JSON。每步是 {{"action": 動作, "arg": 參數}}，動作只能是：
+url（開網址，arg 是網址）、google（Google 搜尋，arg 是關鍵字）、youtube（YouTube 搜尋，arg 是關鍵字，空字串就是開首頁）、
+app（開程式，arg 只能是 %s）、key（媒體鍵，arg 只能是 %s）。做不到就輸出 []。
+要求：{req}""" % ("/".join(PC_APPS), "/".join(PC_KEYS))
+
+
+def pc_keyword_plan(text: str) -> list:
+    """常見說法直接用關鍵字辨識（不用等模型）；辨識不出來回傳 []。"""
+    t = text.lower()
+    q = re.search(r"(?:搜尋|搜索|查詢|search|搜|找|查(?!看))\s*(.+)", t)
+    q = re.sub(r"\s*(的)?(影片|video)$", "", q.group(1)).strip() if q else ""
+    if q:
+        return [{"action": "youtube" if re.search(r"youtube|yt|影片", t) else "google", "arg": q}]
+    url = re.search(r"https?://\S+|\b[\w-]+(\.[\w-]+)*\.(com|org|net|tw|io|tv|app)\S*", t)
+    if url:
+        return [{"action": "url", "arg": url.group(0)}]
+    tail = re.split(r"開啟|打開|開|open|去|進", t)[-1]   # 「在 google 開 youtube」→ 要開的是 youtube
+    for part in (tail, t):
+        for site in PC_SITES:
+            if site in part:
+                return [{"action": "url", "arg": site}]
+        for app, words in PC_APP_WORDS.items():
+            if re.search(words, part):
+                return [{"action": "app", "arg": app}]
+    return [{"action": "key", "arg": k} for k, (_, words) in PC_KEYS.items() if re.search(words, t)][:1]
+
+
+def pc_run(step: dict):
+    """執行一個動作，回傳結果文字；不在允許清單裡的動作回傳 None。"""
+    import webbrowser, ctypes
+    from urllib.parse import quote_plus
+    a, arg = str(step.get("action", "")).lower(), str(step.get("arg") or "").strip()
+    if a == "app" and arg.lower() in PC_APPS:
+        os.startfile(PC_APPS[arg.lower()])
+        return f"🖥️ 已開啟 {arg}"
+    if a == "key" and arg in PC_KEYS:
+        for _ in range(5 if arg.startswith("vol") else 1):   # 音量鍵一次約 2%，按 5 下
+            for flag in (0, 2):
+                ctypes.windll.user32.keybd_event(PC_KEYS[arg][0], 0, flag, 0)
+        return f"🎵 已按下 {arg}"
+    if a == "google":
+        url = "https://www.google.com/search?q=" + quote_plus(arg)
+    elif a == "youtube":
+        url = "https://www.youtube.com/results?search_query=" + quote_plus(arg) if arg else PC_SITES["youtube"]
+    elif a == "url":
+        url = PC_SITES.get(arg.lower()) or (arg if "://" in arg else "https://" + arg)
+    else:
+        return None
+    if not is_safe_url(url):
+        return None
+    webbrowser.open(url)
+    return f"🌐 已開啟 {url}"
+
+
+async def handle_pc_command(message, req: str):
+    if message.author.id not in ALLOWED_USER_IDS:
+        return await message.reply("🔒 抱歉，只有擁有者本人可以操作這台電腦。")
+    if not req:
+        return await message.reply("用法：`!pc 要做的事`，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、"
+                                   "`!pc 開記事本`、`!pc 下一首`、`!pc 音量調高`")
+    plan = pc_keyword_plan(req)
+    if not plan:   # 關鍵字辨識不出來才問模型；GPU 暫停中改問 Claude，不卡住也不碰 GPU
+        try:
+            raw = await (asyncio.to_thread(claude_ask, PC_PROMPT.format(req=req), None, 120) if guard.paused
+                         else run_gpu(local_ask, PC_PROMPT.format(req=req)))
+            m = re.search(r"\[.*\]", raw, re.S)
+            plan = [s for s in json.loads(m.group(0)) if isinstance(s, dict)][:3] if m else []
+        except Exception as e:
+            print(f"⚠️ !pc 解析失敗：{e}")
+    done = []
+    for step in plan:
+        try:
+            done.append(pc_run(step) or f"⛔ 不支援的動作：{step}")
+        except Exception as e:
+            done.append(f"❌ {step.get('arg')}：{str(e)[:200]}")
+    await message.reply("\n".join(done) or "🤔 我看不懂要做什麼。目前能做：開網址、Google/YouTube 搜尋、"
+                        f"開程式（{'、'.join(PC_APPS)}）、媒體鍵（播放/暫停、上一首/下一首、音量、靜音）。")
+
+
+# ----------------------------------------------------------------------------
 # 8. Discord Bot 事件處理 & 背景任務
 # ----------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -2487,7 +2579,11 @@ async def on_message(message):
     gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
     teach_match = re.match(r"^!teach\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match):
+    pc_match = re.match(r"^!pc\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match or pc_match):
+        return
+    if pc_match:
+        await handle_pc_command(message, pc_match.group(1).strip())
         return
     if teach_match:
         await handle_teach_command(message, teach_match.group(1).strip())
