@@ -1165,7 +1165,8 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
         await message.reply(
             "**💬 AI 提問**\n"
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
-            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n\n"
+            "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
+            "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -1982,6 +1983,21 @@ def html_to_pdf(text: str) -> str:
     return base + ".pdf"
 
 
+async def claude_for(message, prompt: str) -> str:
+    """依發問者套用安全版權限執行 Claude：擁有者可上網＋在 claude_outputs 讀寫檔（新檔自動附上），其他人只能上網。"""
+    owner = message.author.id in ALLOWED_USER_IDS
+    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+    before = set(os.listdir(CLAUDE_OUT_DIR))
+    text = await asyncio.to_thread(
+        claude_ask, prompt + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
+        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR)
+    new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
+    new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
+    if new:
+        await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
+    return text
+
+
 async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool = False) -> str:
     """預估會很久（長篇工作）就直接交給 Claude；否則先用本機模型，超過 TAKEOVER_SECONDS 讓 Claude 同時接手，
     誰先完成用誰。Claude 不能用（未登入等）就照常等本機模型。"""
@@ -1991,20 +2007,10 @@ async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool 
     if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
         return local.result()
     await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
-    owner = message.author.id in ALLOWED_USER_IDS
-    os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
-    before = set(os.listdir(CLAUDE_OUT_DIR))
-    remote = asyncio.ensure_future(asyncio.to_thread(
-        claude_ask, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")
-        + ("\n（需要產出檔案時，可以直接建立在目前資料夾，機器人會自動附上。）" if owner else ""),
-        None, 600, OWNER_TOOLS if owner else "WebSearch,WebFetch", CLAUDE_OUT_DIR if owner else BASE_DIR))
+    remote = asyncio.ensure_future(claude_for(message, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
         text = remote.result()
-        new = [os.path.join(CLAUDE_OUT_DIR, f) for f in sorted(set(os.listdir(CLAUDE_OUT_DIR)) - before)]
-        new = [p for p in new if os.path.isfile(p) and os.path.getsize(p) <= ANIM_BYTES][:10]
-        if new:
-            await message.channel.send("📎 Claude 建立的檔案：", files=[discord.File(p) for p in new])
         if want_pdf:   # 路徑單獨一行，on_message 會偵測到並附上檔案
             return "🧠 （由 Claude 接手完成）📄 PDF 已生成：\n" + await asyncio.to_thread(html_to_pdf, text)
         return "🧠 （由 Claude 接手完成）\n" + text
@@ -2243,6 +2249,67 @@ async def handle_team_command(message, task: str):
 
 
 # ----------------------------------------------------------------------------
+# 7.6 !teach：老師模式（Claude 當老師主導教學，本機模型當助教準備例子與練習題）
+# ----------------------------------------------------------------------------
+teach_sessions = {}   # (頻道, 使用者) → {"subject", "level", "log"}，直到 !teach end
+TEACH_LOG_KEEP = 20   # 給老師看的最近課堂紀錄則數
+
+
+async def teach_assist(s: dict, hist: str, said: str) -> str:
+    """本機模型（助教）準備例子與練習題草稿；GPU 暫停、ComfyUI 生成中或太慢就回傳空字串，改由 Claude 自己做。"""
+    if guard.paused or gen_lock.locked():
+        return ""
+    p = (f"你是{s['subject']}老師的助教，學生程度：{s['level']}。\n課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
+         "請為老師準備接下來教學用的草稿：1～2 個貼近學生生活的例子，以及 1 題練習題（附答案與簡短解析）。"
+         "只輸出草稿，300 字內，使用繁體中文。")
+    try:
+        return await asyncio.wait_for(run_gpu(local_ask, p), TAKEOVER_SECONDS)
+    except Exception:
+        return ""
+
+
+async def teach_turn(message, s: dict, said: str):
+    """一輪教學：助教先備草稿，老師（Claude；沒有 Claude 時由本機模型代理）審查後回覆學生。"""
+    hist = "\n\n".join(f"【{n}】{t}" for n, t in s["log"][-TEACH_LOG_KEEP:]) or "（第一堂課，還沒開始）"
+    want_pdf = bool(PDF_RE.search(said))
+    async with message.channel.typing():
+        draft = await teach_assist(s, hist, said)
+        p = (f"你是一位專業的{s['subject']}老師，學生程度：{s['level']}。整堂課由你主導：規劃課程、循序講解、"
+             "出題確認理解、批改學生的回答並說明對錯原因，再依學生表現調整進度與難度。直接對學生說話，使用繁體中文；"
+             "講解要完整，不必刻意縮短；每次回覆的最後要問學生一個問題或出一題練習，讓學生回答。\n\n"
+             f"課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
+             + (f"助教（本機模型）準備的例子與練習題草稿如下，請先審查，錯的改正或捨棄，再挑合適的使用：\n{draft}"
+                if draft else "助教目前不可用，例子與練習題請你自己準備。") + (PDF_HINT if want_pdf else ""))
+        try:
+            text = await claude_for(message, p) if find_claude() else await run_gpu(local_ask, p)
+        except Exception as e:
+            if guard.paused:
+                return await message.reply(f"❌ 老師暫時無法回覆：{str(e)[:300]}")
+            text = await run_gpu(local_ask, p)
+    s["log"] += [("學生", said), ("老師", text)]
+    if want_pdf:
+        return await message.reply("📄 講義 PDF：", file=discord.File(await asyncio.to_thread(html_to_pdf, text)))
+    await post_long(message, text + ("\n\n-# 💻 例子與練習題由本機模型協助準備，老師審查後使用" if draft else ""))
+
+
+async def handle_teach_command(message, arg: str):
+    key = (message.channel.id, message.author.id)
+    if arg.lower() in ("end", "stop", "結束"):
+        return await message.reply("👋 下課了！老師模式已結束。" if teach_sessions.pop(key, None) else "目前沒有進行中的課程。")
+    parts = arg.split(maxsplit=1)
+    if not parts:
+        s = teach_sessions.get(key)
+        return await message.reply(f"📚 上課中：**{s['subject']}**（{s['level']}），輸入 `!teach end` 下課。" if s else
+                                   "用法：`!teach 學科 程度`，例如 `!teach 物理 高一`；之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    teach_sessions[key] = s = {"subject": parts[0], "level": parts[1] if len(parts) > 1 else "初學者", "log": []}
+    await message.reply(f"👩‍🏫 **{s['subject']}**（{s['level']}）課程開始！之後在這個頻道直接打字就是發問或作答，`!teach end` 下課。")
+    try:
+        await teach_turn(message, s, "老師好，我準備好上課了。請先說明這門課的規劃（分哪幾個單元），再開始第一單元。")
+    except Exception as e:
+        await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
+
+
+# ----------------------------------------------------------------------------
 # 8. Discord Bot 事件處理 & 背景任務
 # ----------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -2320,11 +2387,19 @@ async def on_message(message):
         .replace(f"<@!{bot.user.id}>", "")
         .strip()
     )
+    clean_input = re.sub(r"^！", "!", clean_input)  # 全形「！」也當成指令
     is_command = clean_input.startswith("!")
 
     # 作答中：在 DM、@Bot、或同頻道直接打字都視為作答（指令除外）
     if session and not is_command and clean_input:
         await handle_quiz_answer(message, session, clean_input)
+        return
+    teach = teach_sessions.get(key)
+    if teach and not is_command and clean_input:   # 上課中：同頻道直接打字就是發問或作答
+        try:
+            await teach_turn(message, teach, clean_input)
+        except Exception as e:
+            await message.reply(f"❌ 上課時發生錯誤：{str(e)[:500]}")
         return
 
     is_learning_cmd = bool(re.match(r"^!(quiz|review|stats|stop|index|help)\b", clean_input, flags=re.I))
@@ -2333,7 +2408,11 @@ async def on_message(message):
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
     gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match):
+    teach_match = re.match(r"^!teach\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match):
+        return
+    if teach_match:
+        await handle_teach_command(message, teach_match.group(1).strip())
         return
     if team_match:
         await handle_team_command(message, team_match.group(1).strip())
