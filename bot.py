@@ -272,9 +272,35 @@ def is_safe_url(url: str) -> bool:
         return False
 
 
+MATH_RULE = ("\n數學式不要用 LaTeX 或 $ 符號（Discord 不會顯示），改用一般人看得懂的寫法：x²、√(x+1)、×、÷、≤、π、"
+             "分數寫成 (x²+1)/2、導數寫成 dy/dx 或 f′(x)，並用文字說明式子的意思（例如「外層微分 × 內層微分」）。")
+_TEX = {r"\cdot": " × ", r"\times": "×", r"\div": "÷", r"\leq": "≤", r"\geq": "≥", r"\le": "≤", r"\ge": "≥",
+        r"\neq": "≠", r"\approx": "≈", r"\pm": "±", r"\infty": "∞", r"\pi": "π", r"\theta": "θ", r"\alpha": "α",
+        r"\beta": "β", r"\Delta": "Δ", r"\leftarrow": "←", r"\rightarrow": "→", r"\Rightarrow": "⇒", r"\to": "→",
+        r"\circ": "°", r"\prime": "′", r"\quad": " ", r"\int": "∫", r"\sum": "Σ"}
+_SUP, _SUB = str.maketrans("0123456789+-n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ"), str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+
+def delatex(text: str) -> str:
+    """保險：把漏網的常見 LaTeX 轉成一般人看得懂的寫法（金額的 $ 不動）。"""
+    wrap = lambda s: s if re.fullmatch(r"[\w′.⁰-⁹²³¹]+", s) else f"({s})"
+    t = re.sub(r"\$\$?([^$]+?)\$\$?", lambda m: m[1] if re.search(r"[\\^_{}=]", m[1]) else m[0], text)
+    t = re.sub(r"\\(?:left|right)(?![a-zA-Z])|\\displaystyle|\\[,;!]", "", t)
+    for _ in range(5):   # 由內而外處理巢狀
+        t = re.sub(r"\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}", lambda m: f"{wrap(m[1])}/{wrap(m[2])}", t)
+        t = re.sub(r"\\sqrt\{([^{}]*)\}", lambda m: "√" + wrap(m[1]), t)
+        t = re.sub(r"\\(?:boxed|text|mathrm|mathbf|operatorname)\{([^{}]*)\}", r"\1", t)
+        t = re.sub(r"\\lim_\{([^{}]*)\}", r"lim(\1) ", t)
+        t = re.sub(r"\^\{([0-9+\-n]+)\}|\^([0-9n])", lambda m: (m[1] or m[2]).translate(_SUP), t)
+        t = re.sub(r"_\{([0-9]+)\}|_([0-9])", lambda m: (m[1] or m[2]).translate(_SUB), t)
+    for k in sorted(_TEX, key=len, reverse=True):
+        t = t.replace(k, _TEX[k])
+    return re.sub(r"\\(sin|cos|tan|ln|log|lim|exp)(?![a-zA-Z])", r"\1", t)
+
+
 def send_chunks(text: str, limit: int = 1900):
     """把長文字切成 Discord 可接受的段落，盡量在換行處切開。"""
-    text = text or ""
+    text = delatex(text or "")
     chunks = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -497,6 +523,7 @@ RULES:
 7. If the history contains an image analysis result, treat it as the content of the image the user shared earlier.
 8. If the user wants a quiz or practice questions, tell them to use `!quiz 主題` (see `!help`); do not make up questions yourself.
 9. If the input contains [此使用者的學習紀錄], answer questions about their scores/weak topics from it directly without tools.
+10. Never use LaTeX or $ for math (Discord cannot render it); write plain readable math like x², √(x+1), (x²+1)/2, dy/dx and explain formulas in words.
 
 Begin!
 
@@ -929,6 +956,7 @@ def normalize_question(q: dict):
     """驗證並整理單題；格式不合就回傳 None。選擇題會重新洗牌，避免答案總在同一個位置。"""
     if not isinstance(q, dict):
         return None
+    q = {k: [delatex(str(o)) for o in v] if isinstance(v, list) else delatex(v) if isinstance(v, str) else v for k, v in q.items()}
     question = str(q.get("question") or q.get("q") or "").strip()
     answer = str(q.get("answer") or "").strip()
     explain = str(q.get("explanation") or q.get("explain") or "").strip()
@@ -969,7 +997,7 @@ def build_quiz_prompt(topic: str, n: int, material: str, avoid: list) -> str:
         f"你是嚴謹的出題老師。{src}"
         f"請出 {n} 題，其中 {n - n_short} 題為四選一選擇題（type=mc），{n_short} 題為簡答題（type=short）。\n"
         "要求：題目難度由淺到深；選擇題恰有 4 個選項、只有 1 個正確答案、錯誤選項要合理；"
-        "簡答題的答案必須是簡短明確的詞語或一句話；每題都附 1–2 句解析；全部使用繁體中文。\n"
+        "簡答題的答案必須是簡短明確的詞語或一句話；每題都附 1–2 句解析；全部使用繁體中文。" + MATH_RULE + "\n"
         '只輸出 JSON，格式：{"questions":[{"type":"mc","question":"...","options":["...","...","...","..."],'
         '"answer":"A","explanation":"..."},{"type":"short","question":"...","answer":"...","explanation":"..."}]}'
         f"{avoid_txt}"
@@ -2011,7 +2039,7 @@ async def answer_with_takeover(message, prompt: str, local_call, want_pdf: bool 
     if local and (await asyncio.wait({local}, timeout=TAKEOVER_SECONDS))[0]:
         return local.result()
     await message.channel.send("⏳ 這個工作本機模型會花比較久，Claude 接手處理中…")
-    remote = asyncio.ensure_future(claude_for(message, prompt + "\n\n請用繁體中文回答。" + (PDF_HINT if want_pdf else "")))
+    remote = asyncio.ensure_future(claude_for(message, prompt + "\n\n請用繁體中文回答。" + MATH_RULE + (PDF_HINT if want_pdf else "")))
     done, _ = await asyncio.wait({t for t in (local, remote) if t}, return_when=asyncio.FIRST_COMPLETED)
     if remote in done and not remote.exception():
         text = remote.result()
@@ -2209,7 +2237,7 @@ async def team_say(message, log: list, who: str, task: str, ask: str, title: str
     me, other = ("Claude", f"本機模型 {TEXT_MODEL}") if who == "claude" else (f"本機模型 {TEXT_MODEL}", "Claude")
     hist = "\n\n".join(f"【{n}】{t}" for n, t in log) or "（還沒有人發言）"
     prompt = (f"你是{me}，和{other}是同一組的組員，地位平等，要一起完成使用者的任務。\n任務：{task}\n\n"
-              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。")
+              f"目前的討論紀錄：\n{hist}\n\n{ask}使用繁體中文。{MATH_RULE}")
     text = await (asyncio.to_thread(claude_ask, prompt) if who == "claude" else run_gpu(local_ask, prompt))
     log.append((me, text))
     if post:
@@ -2271,7 +2299,7 @@ async def teach_assist(s: dict, hist: str, said: str) -> str:
         return ""
     p = (f"你是{s['subject']}老師的助教，學生程度：{s['level']}。\n課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
          "請為老師準備接下來教學用的草稿：1～2 個貼近學生生活的例子，以及 1 題練習題（附答案與簡短解析）。"
-         "只輸出草稿，300 字內，使用繁體中文。")
+         "只輸出草稿，300 字內，使用繁體中文。" + MATH_RULE)
     try:
         return await asyncio.wait_for(run_gpu(lambda: llm.invoke(p, reasoning=False).content), TAKEOVER_SECONDS)   # 關掉思考，幾秒就好
     except Exception:
@@ -2286,7 +2314,7 @@ async def teach_turn(message, s: dict, said: str):
         draft = await teach_assist(s, hist, said)
         p = (f"你是一位專業的{s['subject']}老師，學生程度：{s['level']}。整堂課由你主導：規劃課程、循序講解、"
              "出題確認理解、批改學生的回答並說明對錯原因，再依學生表現調整進度與難度。直接對學生說話，使用繁體中文；"
-             "講解要完整，不必刻意縮短；每次回覆的最後要問學生一個問題或出一題練習，讓學生回答。\n\n"
+             "講解要完整，不必刻意縮短；每次回覆的最後要問學生一個問題或出一題練習，讓學生回答。" + MATH_RULE + "\n\n"
              f"上課進度與學生情況（存檔紀錄）：\n{s['progress'] or '（新課程，還沒有紀錄）'}\n\n"
              f"課堂紀錄：\n{hist}\n\n學生剛說：{said}\n\n"
              + (f"助教（本機模型）準備的例子與練習題草稿如下，請先審查，錯的改正或捨棄，再挑合適的使用：\n{draft}"
