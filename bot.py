@@ -2597,11 +2597,14 @@ def transcribe(audio: np.ndarray) -> str:
     global _whisper
     with _whisper_lock:
         if _whisper is None:
+            pc_find_app("", refresh=False)   # 先掃一次已安裝的 App，當成辨識熱詞
             from faster_whisper import WhisperModel
             _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
         segs, _ = _whisper.transcribe(audio[:16000 * VOICE_MAX_SECONDS], language="zh", vad_filter=True,
-                                      initial_prompt="以下是繁體中文的句子。")
+                                      initial_prompt="以下是繁體中文的句子。",
+                                      hotwords=pc_hint_words())
         text = "".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
+        text = re.sub(r"(.{4,}?)(?:[\s、，,。]*\1)+", r"\1", text)   # Whisper 偶爾會把同一句重複一次
     return "" if HALLUCINATIONS.search(text) and len(text) < 30 else text
 
 
@@ -2693,12 +2696,12 @@ VOICE_COMMANDS = [
     (r"(?:恢復|繼續)\s*(?:使用)?\s*(?:gpu|顯卡)", "!gpu resume", False),
     (r"(?:檢查|查看|看|顯示)?\s*(?:gpu|顯卡)\s*(?:守護)?\s*(?:的)?\s*(?:狀態|狀況|使用率)?", "!gpu", False),
     (r"(?:重新|自動)\s*(?:挑選?|選擇?)\s*模型|換(?:最強的?)?模型", "!model auto", False),
-    (r"(?:查看|看|檢查)?\s*(?:目前|現在)?\s*(?:的)?\s*模型(?:狀態)?|.*(?:用|是)(?:什麼|哪個|哪一個)模型", "!model", False),
+    (r"(?:查看|看|檢查)?\s*(?:目前|現在)?\s*(?:的)?\s*(?:本機)?\s*模型(?:狀態)?|.*(?:用|是)(?:什麼|哪個|哪一個)模型", "!model", False),
     (r"(?:出|來|給我|考我)\s*(\d+|[一二兩三四五六七八九十]+)\s*題\s*(?:關於)?\s*(.+?)(?:的)?(?:題目|考題|測驗)?", lambda m: f"!quiz {m[2]} {cn_num(m[1])}", False),
     (r"(?:考我|測驗我?|小考)\s*(?:關於)?\s*(.+?)(?:的)?(?:題目|考題)?", r"!quiz \1", False),
     (r"複習(?:錯題)?|錯題複習", "!review", False),
     (r"(?:查看?|看)?\s*(?:我的)?\s*(?:成績|學習(?:紀錄|統計|狀況)|正確率)", "!stats", False),
-    (r"(?:更新|建立|重建)\s*(?:圖片)?\s*索引", "!index", False),
+    (r"(?:更新|建立|重建)\s*(?:圖片|資料[夾加])?\s*索引", "!index", False),
     (r"(?:有(?:哪些|什麼)指令|指令(?:清單|列表|說明)?|使用說明|help)", "!help", False),
     (r"(?:組隊|團隊合作|一起合作|協作)\s*(.+)", r"!team \1", False),
     (r"(?:用\s*)?svg\s*(?:畫)?\s*(.+)", r"!svg \1", False),
@@ -2706,22 +2709,58 @@ VOICE_COMMANDS = [
     (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:短)?影片\s*(.*)", r"!video \1", False),
     (r"(?:畫|生成|產生)\s*(?:一(?:張|幅))?\s*(?:圖片?|畫)?\s*(.+)", r"!image \1", False),
     (r"(?:電腦|在電腦上?)\s*(.+)", r"!pc \1", False),
+    (r"(?:在|用)?\s*youtube\s*(?:上)?\s*(?:播放?|放|看|聽|找|搜尋?)\s*(.+)", r"!pc youtube 搜尋 \1", False),
+    (r"(?:在|用)?\s*google\s*(?:上)?\s*(?:搜尋?|查|找)\s*(.+)", r"!pc google 搜尋 \1", False),
+    (r"(?:播放|放|聽)\s*(?!音樂|歌)(.+?)\s*(?:的)?\s*(?:歌曲?|音樂|mv)", r"!pc youtube 搜尋 \1", False),
     (r"(ask|pc|teach|quiz|review|stats|stop|index|help|team|image|img|video|svg|anim|gpu|model|voice)\b\s*(.*)", r"!\1 \2", False),
 ]
-PC_SPOKEN = re.compile(r"(?:打開|開啟|開|播放|暫停|繼續播放|下一首|上一首|靜音|音量|大聲|小聲|調(?:高|低|大|小))")
+# 開電腦 app：口說常見的別名 / Whisper 常見的同音字 → !pc 認得的名字
+PC_ALIASES = {r"油管|優兔|u\s*tube|you\s*tube": "youtube", r"谷歌|估狗|咕狗": "google", r"臉書|fb": "facebook",
+              r"\big\b|哀居": "instagram", r"網飛": "netflix", r"谷歌瀏覽器|google\s*chrome|瀏覽器": "chrome",
+              r"筆記本|記事簿": "記事本", r"計算器|計數機": "計算機", r"檔案管理員?|我的電腦": "檔案總管",
+              r"git\s*hub": "github", r"chat\s*gpt": "chatgpt", r"g\s*mail": "gmail",
+              r"調大|開大|大聲一?點": "調高", r"調小|關小|小聲一?點": "調低"}
+PC_OPEN = re.compile(r"(?:打開|開啟|啟動|執行|叫出|開一下|開|去|進|看|聽|播放|暫停|繼續播放|下一首|上一首|靜音|音量|大聲|小聲|調(?:高|低|大|小))")
+PC_SPLIT = re.compile(r"\s*(?:然後|接著|之後|再來|再|並且|並|順便|跟|和)\s*")
 
 
-def spoken_to_command(text: str, in_session: bool):
-    """把辨識出的話轉成指令；回傳 (要處理的文字, 指令或 None)。不是指令就當 !ask 問題（上課/測驗中當作答）。"""
+def pc_hint_words() -> str:
+    """給 Whisper 的熱詞：常用網站/程式＋電腦上已安裝的 App 名稱，讓「打開 Steam」這類名稱更容易被聽對。"""
+    words = list(PC_SITES) + [w for v in PC_APP_WORDS.values() for w in v.split("|") if re.fullmatch(r"[\w一-鿿]+", w)]
+    return " ".join(dict.fromkeys(words + sorted((k for k in _start_apps if len(k) <= 16), key=len)[:60]))
+
+
+def spoken_pc(t: str, owner: bool) -> list:
+    """口說的開 app／媒體鍵要求 → 依序執行的 !pc 指令（「打開記事本然後開 YouTube」會拆成兩步）；不是就回傳 []。"""
+    t = re.sub(r"(?:一下|一點|吧|好嗎|好不好|謝謝|給我|拜託)+$", "", t).strip()
+    parts = [p if i == 0 or PC_OPEN.match(p) else "打開" + p for i, p in enumerate(PC_SPLIT.split(t)) if p]   # 「打開記事本跟 YouTube」
+    if len(parts) > 1 and all(PC_OPEN.search(p) and pc_keyword_plan(p) for p in parts):
+        return [f"!pc {p}" for p in parts[:3]]
+    plan = PC_OPEN.match(t) and pc_keyword_plan(t)
+    # 「看/聽/去…」開頭的也可能只是問題：只認網站與常用程式，不模糊比對其他 App
+    weak = re.match(r"(?:看|聽|去|進)(?:一下)?\s*(.*)", t)
+    if plan and (not weak or plan[0]["action"] != "app" or plan[0]["arg"] in PC_APPS
+                 or plan[0]["arg"].lower() in weak[1] and len(weak[1]) <= len(plan[0]["arg"]) + 2):
+        return [f"!pc {t}"]
+    # 擁有者明確說「打開/啟動…」但關鍵字認不出來：交給 !pc 的模型判斷，做不到它會說明能開哪些
+    return [f"!pc {t}"] if owner and re.match(r"打開|開啟|啟動|執行", t) else []
+
+
+def spoken_to_command(text: str, in_session: bool, owner: bool = False):
+    """把辨識出的話轉成指令；回傳 (要處理的文字, 指令或 None)，多步驟時文字以換行分隔。
+    不是指令就當 !ask 問題（上課/測驗中當作答）。"""
     t = re.sub(r"[，。！？、,.!?]+", " ", text).strip()
-    t = re.sub(r"^(?:(?:請|幫我|麻煩你?|我(?:要|想)|可以|嗨|嘿|好|那)\s*)+", "", t, flags=re.I)
+    t = re.sub(r"^(?:(?:請|幫我|麻煩你?|我(?:要|想)|可以|嗨|嘿|好|那|你)\s*)+", "", t, flags=re.I).lower()
+    for pat, name in PC_ALIASES.items():   # 只用來比對指令；當成問題時仍用原句
+        t = re.sub(pat, name, t)
     for pat, tmpl, always in VOICE_COMMANDS:
         m = re.fullmatch(pat, t, flags=re.I | re.S)
         if m and (always or not in_session):
             cmd = (tmpl(m) if callable(tmpl) else m.expand(tmpl)).strip()
             return cmd, cmd
-    if not in_session and PC_SPOKEN.match(t) and pc_keyword_plan(t):
-        return f"!pc {t}", f"!pc {t}"
+    pc = [] if in_session else spoken_pc(t, owner)
+    if pc:
+        return "\n".join(pc), "、".join(pc)
     return (text if in_session else f"!ask {text}"), None
 
 
@@ -2729,7 +2768,8 @@ async def handle_spoken(message, text: str, speak, post=None):
     """辨識完的語音：顯示聽到什麼與執行的指令，照打字一樣處理，再把回覆交給 speak 念出來。
     post 有值（語音頻道）＝用它貼出聽到的話，之後的回覆都接在那則訊息底下。"""
     key = (message.channel.id, message.author.id)
-    content, cmd = spoken_to_command(text, key in quiz_sessions or key in teach_sessions)
+    content, cmd = await asyncio.to_thread(spoken_to_command, text, key in quiz_sessions or key in teach_sessions,
+                                           message.author.id in ALLOWED_USER_IDS)   # 第一次會掃描已安裝的 App
     who = f"**{message.author.display_name}**：" if post else "聽到："
     posted = await (post or message.reply)(f"🎙️ {who}「{text}」" + (f" → 執行 `{cmd}`" if cmd else ""))
     if post:
@@ -2737,7 +2777,8 @@ async def handle_spoken(message, text: str, speak, post=None):
     texts = []
     token = speech_out.set(texts)
     try:
-        await on_text(message, content)
+        for line in content.split("\n") if cmd else [content]:
+            await on_text(message, line)
     finally:
         speech_out.reset(token)
     if texts:
@@ -2928,7 +2969,7 @@ async def on_message(message):
             text = await asyncio.to_thread(transcribe, await asyncio.to_thread(decode_audio, await audio.read()))
         except Exception as e:
             return await message.reply(f"❌ 語音辨識失敗：{str(e)[:300]}")
-    if not addressed and not (text and spoken_to_command(text, False)[1]):
+    if not addressed and not (text and (await asyncio.to_thread(spoken_to_command, text, False))[1]):
         return
     if not text:
         return await message.reply("🎙️ 沒聽清楚，可以再說一次嗎？")
