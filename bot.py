@@ -1199,7 +1199,10 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "`!ask 問題`　直接問 AI，不用 @我，例如 `!ask 幫我查台積電股價`（可附上圖片）\n"
             "`!team 任務`　本機模型與 Claude 像組員一樣互相討論、一起分工、各自完成後互相審查，過程與結果都貼在頻道\n"
             "`!teach 學科 程度`　老師模式，例如 `!teach 物理 高一`：Claude 當老師講解、出題、批改，本機模型當助教；之後在頻道直接打字就是發問或作答，`!teach end` 下課；進度依科目分開存在 reference_docs/上課紀錄，下次同學科會接續，`!quiz` 也會參考\n"
-            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 開 Steam`、`!pc 關閉 YouTube`、`!pc 下一首`；只會開網址、搜尋、開關已安裝的程式、關網站分頁、按媒體鍵，不會執行任何指令\n\n"
+            "`!pc 要做的事`　（限擁有者）叫電腦做事，例如 `!pc 在 google 開 youtube`、`!pc youtube 搜尋 lofi`、`!pc 開記事本`、`!pc 開 Steam`、`!pc 關閉 YouTube`、`!pc 下一首`；只會開網址、搜尋、開關已安裝的程式、關網站分頁、按媒體鍵，不會執行任何指令\n"
+            "`!voice join` / `!voice leave`　我進入/離開你所在的語音頻道，直接說話就能對話或下指令，回覆會念出來也會貼在頻道\n"
+            "🎙️ 也可以傳**語音訊息**（私訊、回覆我、或測驗/上課中）：我聽懂後照指令處理並用語音回覆。說「開啟老師模式 物理 高一」"
+            "「檢查 GPU 狀態」「出五題 Python 迴圈」「打開 YouTube」就等於打對應的指令；伺服器裡的語音只有聽得出是指令才會處理\n\n"
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
@@ -2557,6 +2560,291 @@ async def handle_pc_command(message, req: str):
 
 
 # ----------------------------------------------------------------------------
+# 7.8 語音：語音訊息 / 語音頻道 → 本機 Whisper（CPU，不佔 GPU）辨識 → 照打字的指令處理 → edge-tts 台灣口音念出回覆
+# ----------------------------------------------------------------------------
+import contextvars
+from types import SimpleNamespace
+import numpy as np
+import av
+import edge_tts
+import nacl.secret
+try:
+    import davey   # Discord 語音端對端加密（DAVE）
+except ImportError:
+    davey = None
+
+WHISPER_MODEL = getenv_user("WHISPER_MODEL", "large-v3-turbo")   # 實測 CPU 上 6 秒語音約 3 秒辨識完、中文最準
+TTS_VOICE = getenv_user("TTS_VOICE", "zh-TW-HsiaoChenNeural")
+TTS_MAX_CHARS = 800          # 念太長很久，超過的部分請看文字
+VOICE_MAX_SECONDS = 300
+HALLUCINATIONS = re.compile(r"字幕|訂閱|點贊|點讚|按讚|觀看|收看|Amara|謝謝大家|請不吝")   # Whisper 對雜音常見的幻覺
+speech_out = contextvars.ContextVar("speech_out", default=None)   # 處理語音輸入期間，Bot 送出的文字都收集起來念
+_whisper, _whisper_lock = None, threading.Lock()
+
+
+def decode_audio(data: bytes, rate=16000, layout="mono", fmt="flt") -> np.ndarray:
+    out = []
+    with av.open(io.BytesIO(data)) as c:
+        rs = av.AudioResampler(format=fmt, layout=layout, rate=rate)
+        for f in c.decode(audio=0):
+            out += [g.to_ndarray().reshape(-1) for g in rs.resample(f)]
+        out += [g.to_ndarray().reshape(-1) for g in rs.resample(None)]
+    return np.concatenate(out) if out else np.zeros(0, np.float32)
+
+
+def transcribe(audio: np.ndarray) -> str:
+    """16 kHz 單聲道 float → 繁體中文文字（同步，請用 asyncio.to_thread）。"""
+    global _whisper
+    with _whisper_lock:
+        if _whisper is None:
+            from faster_whisper import WhisperModel
+            _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segs, _ = _whisper.transcribe(audio[:16000 * VOICE_MAX_SECONDS], language="zh", vad_filter=True,
+                                      initial_prompt="以下是繁體中文的句子。")
+        text = "".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
+    return "" if HALLUCINATIONS.search(text) and len(text) < 30 else text
+
+
+def speakable(texts: list) -> str:
+    t = re.sub(r"```.*?```", "（程式碼請看文字）", "\n".join(texts), flags=re.S)
+    t = re.sub(r"https?://\S+|<[^>]+>|-# .*|[*_`#>|~]", "", t)
+    t = re.sub(r"[\U0001F000-\U0001FFFF☀-➿️]", "", t).strip()
+    return t[:TTS_MAX_CHARS] + ("……其餘內容請看文字訊息。" if len(t) > TTS_MAX_CHARS else "")
+
+
+async def tts_mp3(text: str) -> bytes:
+    data = b""
+    async for ch in edge_tts.Communicate(text, TTS_VOICE).stream():
+        if ch["type"] == "audio":
+            data += ch["data"]
+    return data
+
+
+def mp3_to_voice_ogg(mp3: bytes):
+    """轉成 Discord 語音訊息要的 OGG/Opus，回傳 (ogg, 秒數, 波形 base64)。"""
+    dst = io.BytesIO()
+    with av.open(io.BytesIO(mp3)) as i, av.open(dst, "w", format="ogg") as o:
+        st = o.add_stream("libopus", rate=48000, layout="mono")
+        for f in i.decode(audio=0):
+            f.pts = None
+            o.mux(st.encode(f))
+        o.mux(st.encode(None))
+    a = np.abs(decode_audio(mp3, 8000))
+    wave = np.array([c.mean() for c in np.array_split(a, min(256, max(1, len(a))))])
+    wave = (wave / (wave.max() or 1) * 255).astype(np.uint8)
+    return dst.getvalue(), len(a) / 8000, base64.b64encode(wave.tobytes()).decode()
+
+
+class VoiceFile(discord.File):
+    def __init__(self, ogg: bytes, secs: float, wave: str):
+        super().__init__(io.BytesIO(ogg), "voice-message.ogg")
+        self.secs, self.wave = secs, wave
+
+    def to_dict(self, index):
+        return super().to_dict(index) | {"duration_secs": self.secs, "waveform": self.wave}
+
+
+async def send_voice_reply(message, texts: list):
+    """把收集到的回覆念成語音訊息，回覆在原訊息底下。"""
+    text = speakable(texts)
+    if not text:
+        return
+    try:
+        ogg, secs, wave = await asyncio.to_thread(mp3_to_voice_ogg, await tts_mp3(text))
+        with discord.http.handle_message_parameters(file=VoiceFile(ogg, secs, wave), flags=discord.MessageFlags._from_value(8192),
+                                                    message_reference=message.to_reference(fail_if_not_exists=False).to_message_reference_dict()) as p:
+            await bot.http.send_message(message.channel.id, params=p)
+    except Exception as e:
+        print(f"⚠️ 語音回覆失敗：{type(e).__name__}: {e}")
+
+
+_orig_send = discord.abc.Messageable.send
+
+
+async def _send_and_collect(self, content=None, **kw):
+    buf = speech_out.get()
+    if buf is not None and content and not str(content).startswith(("⏳", "🎙️", "🔍")):   # 進度提示不念
+        buf.append(str(content))
+    return await _orig_send(self, content, **kw)
+
+
+discord.abc.Messageable.send = _send_and_collect
+
+_CN_NUM = {c: i for i, c in enumerate("零一二三四五六七八九")} | {"兩": 2}
+
+
+def cn_num(s: str) -> int:
+    """「5」「五」「十二」「二十」→ 數字。"""
+    if s.isdigit():
+        return int(s)
+    a, ten, b = s.partition("十")
+    return (_CN_NUM.get(a, 1) * 10 + _CN_NUM.get(b, 0)) if ten else _CN_NUM.get(s, 5)
+
+
+# 口說 → 指令。(句型, 指令範本, 測驗/上課中也生效)；由上而下比對第一個符合的
+VOICE_COMMANDS = [
+    (r"(?:驚嘆號|感嘆號)\s*([a-z]+)\s*(.*)", r"!\1 \2", True),
+    (r"(?:下課|結束(?:上課|課程|老師模式|教師模式)|關閉(?:老師|教師)模式)", "!teach end", True),
+    (r"(?:停止|結束|取消)(?:測驗|考試|檢測)|不考了", "!stop", True),
+    (r"(?:離開|退出|結束)\s*語音(?:頻道)?", "!voice leave", True),
+    (r"(?:進|加入|進入|來)\s*(?:到)?\s*語音(?:頻道)?", "!voice join", False),
+    (r"(?:開啟|開始|進入|打開|啟動)?\s*(?:老師|教師|上課)模式\s*(.*)", r"!teach \1", False),
+    (r"(?:暫停|停止)\s*(?:使用)?\s*(?:gpu|顯卡)", "!gpu pause", False),
+    (r"(?:恢復|繼續)\s*(?:使用)?\s*(?:gpu|顯卡)", "!gpu resume", False),
+    (r"(?:檢查|查看|看|顯示)?\s*(?:gpu|顯卡)\s*(?:守護)?\s*(?:的)?\s*(?:狀態|狀況|使用率)?", "!gpu", False),
+    (r"(?:重新|自動)\s*(?:挑選?|選擇?)\s*模型|換(?:最強的?)?模型", "!model auto", False),
+    (r"(?:查看|看|檢查)?\s*(?:目前|現在)?\s*(?:的)?\s*模型(?:狀態)?|.*(?:用|是)(?:什麼|哪個|哪一個)模型", "!model", False),
+    (r"(?:出|來|給我|考我)\s*(\d+|[一二兩三四五六七八九十]+)\s*題\s*(?:關於)?\s*(.+?)(?:的)?(?:題目|考題|測驗)?", lambda m: f"!quiz {m[2]} {cn_num(m[1])}", False),
+    (r"(?:考我|測驗我?|小考)\s*(?:關於)?\s*(.+?)(?:的)?(?:題目|考題)?", r"!quiz \1", False),
+    (r"複習(?:錯題)?|錯題複習", "!review", False),
+    (r"(?:查看?|看)?\s*(?:我的)?\s*(?:成績|學習(?:紀錄|統計|狀況)|正確率)", "!stats", False),
+    (r"(?:更新|建立|重建)\s*(?:圖片)?\s*索引", "!index", False),
+    (r"(?:有(?:哪些|什麼)指令|指令(?:清單|列表|說明)?|使用說明|help)", "!help", False),
+    (r"(?:組隊|團隊合作|一起合作|協作)\s*(.+)", r"!team \1", False),
+    (r"(?:用\s*)?svg\s*(?:畫)?\s*(.+)", r"!svg \1", False),
+    (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:程式)?動畫\s*(.*)", r"!anim \1", False),
+    (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:短)?影片\s*(.*)", r"!video \1", False),
+    (r"(?:畫|生成|產生)\s*(?:一(?:張|幅))?\s*(?:圖片?|畫)?\s*(.+)", r"!image \1", False),
+    (r"(?:電腦|在電腦上?)\s*(.+)", r"!pc \1", False),
+    (r"(ask|pc|teach|quiz|review|stats|stop|index|help|team|image|img|video|svg|anim|gpu|model|voice)\b\s*(.*)", r"!\1 \2", False),
+]
+PC_SPOKEN = re.compile(r"(?:打開|開啟|開|播放|暫停|繼續播放|下一首|上一首|靜音|音量|大聲|小聲|調(?:高|低|大|小))")
+
+
+def spoken_to_command(text: str, in_session: bool):
+    """把辨識出的話轉成指令；回傳 (要處理的文字, 指令或 None)。不是指令就當 !ask 問題（上課/測驗中當作答）。"""
+    t = re.sub(r"[，。！？、,.!?]+", " ", text).strip()
+    t = re.sub(r"^(?:(?:請|幫我|麻煩你?|我(?:要|想)|可以|嗨|嘿|好|那)\s*)+", "", t, flags=re.I)
+    for pat, tmpl, always in VOICE_COMMANDS:
+        m = re.fullmatch(pat, t, flags=re.I | re.S)
+        if m and (always or not in_session):
+            cmd = (tmpl(m) if callable(tmpl) else m.expand(tmpl)).strip()
+            return cmd, cmd
+    if not in_session and PC_SPOKEN.match(t) and pc_keyword_plan(t):
+        return f"!pc {t}", f"!pc {t}"
+    return (text if in_session else f"!ask {text}"), None
+
+
+async def handle_spoken(message, text: str, speak, post=None):
+    """辨識完的語音：顯示聽到什麼與執行的指令，照打字一樣處理，再把回覆交給 speak 念出來。
+    post 有值（語音頻道）＝用它貼出聽到的話，之後的回覆都接在那則訊息底下。"""
+    key = (message.channel.id, message.author.id)
+    content, cmd = spoken_to_command(text, key in quiz_sessions or key in teach_sessions)
+    who = f"**{message.author.display_name}**：" if post else "聽到："
+    posted = await (post or message.reply)(f"🎙️ {who}「{text}」" + (f" → 執行 `{cmd}`" if cmd else ""))
+    if post:
+        message.id, message.reply = posted.id, posted.reply
+    texts = []
+    token = speech_out.set(texts)
+    try:
+        await on_text(message, content)
+    finally:
+        speech_out.reset(token)
+    if texts:
+        await speak(texts)
+
+
+# ---- 語音頻道：收音（自己解 RTP 加密＋DAVE）、依停頓切句、播放回覆 ----
+voice_ssrc = {}   # SSRC → 使用者 ID（語音閘道 op 5 SPEAKING 告知）
+_orig_vws_recv = discord.gateway.DiscordVoiceWebSocket.received_message
+
+
+async def _vws_recv(self, msg):
+    if msg.get("op") == 5 and msg.get("d", {}).get("user_id"):
+        voice_ssrc[msg["d"]["ssrc"]] = int(msg["d"]["user_id"])
+    await _orig_vws_recv(self, msg)
+
+
+discord.gateway.DiscordVoiceWebSocket.received_message = _vws_recv
+voice_sessions = {}   # guild id → VoiceSession
+PCM_RATE = 48000 * 2 * 2   # Discord 解出來是 48 kHz 雙聲道 16-bit
+
+
+class VoiceSession:
+    PAUSE, MIN_SEC, MAX_SEC = 0.8, 0.5, 30   # 停頓 0.8 秒算一句；太短的雜音略過；最長 30 秒強制切
+
+    def __init__(self, vc, text_channel):
+        self.vc, self.text, self.bufs, self.last, self.decoders = vc, text_channel, {}, {}, {}
+        self.lock, self.talk = threading.Lock(), asyncio.Lock()
+        vc._connection.add_socket_listener(self.on_packet)
+        self.task = asyncio.create_task(self.loop())
+
+    def on_packet(self, data: bytes):   # 在 socket 執行緒被呼叫
+        if len(data) < 16 or data[1] & 0x7F != 120:   # 只要 Opus 語音，略過 RTCP
+            return
+        uid, st = voice_ssrc.get(int.from_bytes(data[8:12], "big")), self.vc._connection
+        if not uid:
+            return
+        hl = 12 + 4 * (data[0] & 0x0F) + (4 if data[0] & 0x10 else 0)
+        try:
+            pt = nacl.secret.Aead(bytes(st.secret_key)).decrypt(data[hl:-4], data[:hl], data[-4:] + bytes(20))
+            if data[0] & 0x10:   # 加密內容開頭是 RTP 擴充欄位，跳過
+                pt = pt[int.from_bytes(data[hl - 2:hl], "big") * 4:]
+            if st.dave_session and st.dave_session.ready and pt[-2:] == b"\xfa\xfa":
+                pt = st.dave_session.decrypt(uid, davey.MediaType.audio, pt)
+            pcm = self.decoders.setdefault(uid, discord.opus.Decoder()).decode(pt)
+        except Exception:
+            return
+        with self.lock:
+            self.bufs.setdefault(uid, bytearray()).extend(pcm)
+            self.last[uid] = time.monotonic()
+
+    async def loop(self):
+        while self.vc.is_connected():
+            await asyncio.sleep(0.25)
+            now = time.monotonic()
+            with self.lock:
+                done = [u for u, b in self.bufs.items() if now - self.last[u] > self.PAUSE or len(b) > PCM_RATE * self.MAX_SEC]
+                chunks = [(u, self.bufs.pop(u)) for u in done]
+            for uid, pcm in chunks:
+                if len(pcm) > PCM_RATE * self.MIN_SEC and uid != bot.user.id:
+                    asyncio.create_task(self.utterance(uid, bytes(pcm)))
+
+    async def utterance(self, uid: int, pcm: bytes):
+        a = np.frombuffer(pcm, np.int16).reshape(-1, 2).mean(1) / 32768
+        text = await asyncio.to_thread(transcribe, a[:len(a) // 3 * 3].reshape(-1, 3).mean(1).astype(np.float32))
+        member = self.vc.guild.get_member(uid)
+        if not text or not member:
+            return
+        async with self.talk:   # 一次處理一句，回覆依序念
+            msg = SimpleNamespace(id=0, channel=self.text, guild=self.vc.guild, author=member, content=text,
+                                  attachments=[], reference=None, mentions=[], mention_everyone=False, reply=None)
+            await handle_spoken(msg, text, self.play, lambda s: _orig_send(self.text, s))
+
+    async def play(self, texts: list):
+        text = speakable(texts)
+        if not text or not self.vc.is_connected():
+            return
+        pcm = await asyncio.to_thread(decode_audio, await tts_mp3(text), 48000, "stereo", "s16")
+        while self.vc.is_playing():
+            await asyncio.sleep(0.2)
+        self.vc.play(discord.PCMAudio(io.BytesIO(pcm.tobytes())))
+
+
+async def handle_voice_command(message, arg: str):
+    vc = message.guild and message.guild.voice_client
+    if arg.lower() in ("leave", "stop", "離開"):
+        if not vc:
+            return await message.reply("我目前不在語音頻道。")
+        voice_sessions.pop(message.guild.id, None)
+        await vc.disconnect()
+        return await message.reply("👋 已離開語音頻道。")
+    where = getattr(getattr(message.author, "voice", None), "channel", None)
+    if not where:
+        return await message.reply("請先進入一個語音頻道，再輸入 `!voice join`（或說「進語音」）。")
+    if davey is None:
+        return await message.reply("❌ 缺少語音加密套件，請在電腦上執行：`python -m pip install davey PyNaCl`")
+    if vc:
+        await vc.move_to(where)
+    else:
+        vc = await where.connect(self_deaf=False)
+    voice_sessions[message.guild.id] = s = VoiceSession(vc, message.channel)
+    asyncio.create_task(s.play(["我來了，直接說話就可以。"]))   # 先送出聲音，Discord 才會開始把大家的語音傳給 Bot
+    await message.reply(f"🎧 已加入 **{where.name}**，直接說話就好（跟打字一樣可以下指令），回覆會念出來也會貼在這裡。"
+                        "說「離開語音」或輸入 `!voice leave` 結束。")
+
+
+# ----------------------------------------------------------------------------
 # 8. Discord Bot 事件處理 & 背景任務
 # ----------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -2612,6 +2900,14 @@ async def on_ready():
 
 
 @bot.event
+async def on_voice_state_update(member, before, after):
+    vc = member.guild.voice_client
+    if vc and not [m for m in vc.channel.members if not m.bot]:   # 大家都離開了，Bot 也離開
+        voice_sessions.pop(member.guild.id, None)
+        await vc.disconnect()
+
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
@@ -2620,6 +2916,27 @@ async def on_message(message):
     if ENABLE_USER_WHITELIST and message.author.id not in ALLOWED_USER_IDS:
         return
 
+    audio = next((a for a in message.attachments if (a.content_type or "").startswith("audio/")), None)
+    if not audio or (message.content and not message.flags.voice):
+        return await on_text(message)
+    # 語音訊息：私訊、測驗/上課中、回覆或 @Bot 時一定處理；伺服器裡其他語音只在聽得出是指令時處理
+    key, ref = (message.channel.id, message.author.id), message.reference and message.reference.resolved
+    addressed = (isinstance(message.channel, discord.DMChannel) or key in quiz_sessions or key in teach_sessions
+                 or bot.user.mentioned_in(message) or getattr(ref, "author", None) == bot.user)
+    async with message.channel.typing():
+        try:
+            text = await asyncio.to_thread(transcribe, await asyncio.to_thread(decode_audio, await audio.read()))
+        except Exception as e:
+            return await message.reply(f"❌ 語音辨識失敗：{str(e)[:300]}")
+    if not addressed and not (text and spoken_to_command(text, False)[1]):
+        return
+    if not text:
+        return await message.reply("🎙️ 沒聽清楚，可以再說一次嗎？")
+    await handle_spoken(message, text, lambda texts: send_voice_reply(message, texts))
+
+
+async def on_text(message, content: str = None):
+    """處理打字（或語音辨識後）的訊息；content 有值就取代訊息本文。"""
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user.mentioned_in(message)
     key = (message.channel.id, message.author.id)
@@ -2629,7 +2946,7 @@ async def on_message(message):
         session = None
 
     clean_input = (
-        message.content
+        (message.content if content is None else content)
         .replace(f"<@{bot.user.id}>", "")
         .replace(f"<@!{bot.user.id}>", "")
         .strip()
@@ -2657,7 +2974,12 @@ async def on_message(message):
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
     teach_match = re.match(r"^!teach\b\s*(.*)$", clean_input, flags=re.I | re.S)
     pc_match = re.match(r"^!pc\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match or pc_match):
+    voice_match = re.match(r"^!voice\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    if not (is_mentioned or is_dm or is_learning_cmd or is_gpu_cmd or ask_match or gen_match or team_match or teach_match
+            or pc_match or voice_match):
+        return
+    if voice_match:
+        await handle_voice_command(message, voice_match.group(1).strip())
         return
     if pc_match:
         await handle_pc_command(message, pc_match.group(1).strip())
