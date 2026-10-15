@@ -2567,6 +2567,11 @@ from types import SimpleNamespace
 import numpy as np
 import av
 import edge_tts
+try:
+    from opencc import OpenCC
+    to_trad = OpenCC("s2tw").convert   # Whisper 偶爾吐簡體，一律轉成台灣繁體
+except ImportError:
+    to_trad = str
 import nacl.secret
 try:
     import davey   # Discord 語音端對端加密（DAVE）
@@ -2592,20 +2597,32 @@ def decode_audio(data: bytes, rate=16000, layout="mono", fmt="flt") -> np.ndarra
     return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
-def transcribe(audio: np.ndarray) -> str:
-    """16 kHz 單聲道 float → 繁體中文文字（同步，請用 asyncio.to_thread）。"""
+VOICE_HOTWORDS = "老師模式 GPU YouTube Steam"   # 只放容易聽錯的專有名詞；常見字（打開、關閉）放進來反而會聽錯
+
+
+def pcm48_to16(pcm: bytes) -> np.ndarray:
+    """Discord 的 48 kHz 雙聲道 → Whisper 要的 16 kHz 單聲道（用正式重取樣，比直接抽樣清楚）。"""
+    f = av.AudioFrame.from_ndarray(np.frombuffer(pcm, np.int16).reshape(1, -1), format="s16", layout="stereo")
+    f.sample_rate = 48000
+    rs = av.AudioResampler(format="flt", layout="mono", rate=16000)
+    return np.concatenate([g.to_ndarray().reshape(-1) for g in rs.resample(f) + rs.resample(None)])
+
+
+def transcribe(audio: np.ndarray, extra: str = ""):
+    """16 kHz 單聲道 float → (繁體中文文字, 是否有把握)（同步，請用 asyncio.to_thread）。extra 是額外熱詞（如上課科目）。"""
     global _whisper
     with _whisper_lock:
         if _whisper is None:
             pc_find_app("", refresh=False)   # 先掃一次已安裝的 App，當成辨識熱詞
             from faster_whisper import WhisperModel
-            _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segs, _ = _whisper.transcribe(audio[:16000 * VOICE_MAX_SECONDS], language="zh", vad_filter=True,
-                                      initial_prompt="以下是繁體中文的句子。",
-                                      hotwords=pc_hint_words())
-        text = "".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
-        text = re.sub(r"(.{4,}?)(?:[\s、，,。]*\1)+", r"\1", text)   # Whisper 偶爾會把同一句重複一次
-    return "" if HALLUCINATIONS.search(text) and len(text) < 30 else text
+            _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)   # 全部執行緒：每句快約 1.5 秒
+        segs, _ = _whisper.transcribe(audio[:16000 * VOICE_MAX_SECONDS], language="zh",
+                                      vad_filter=True, vad_parameters={"speech_pad_ms": 300}, initial_prompt="以下是繁體中文的句子。",
+                                      hotwords=f"{extra} {VOICE_HOTWORDS} {pc_hint_words()}".strip())
+        segs = [s for s in segs if s.no_speech_prob < 0.6]
+        text = re.sub(r"(.{4,}?)(?:[\s、，,。]*\1)+", r"\1", to_trad("".join(s.text for s in segs).strip()))   # Whisper 偶爾會把同一句重複一次
+    sure = not segs or sum(s.avg_logprob for s in segs) / len(segs) > -1.0
+    return ("", True) if HALLUCINATIONS.search(text) and len(text) < 30 else (text, sure)
 
 
 def speakable(texts: list) -> str:
@@ -2709,6 +2726,7 @@ VOICE_COMMANDS = [
     (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:短)?影片\s*(.*)", r"!video \1", False),
     (r"(?:畫|生成|產生)\s*(?:一(?:張|幅))?\s*(?:圖片?|畫)?\s*(.+)", r"!image \1", False),
     (r"(?:電腦|在電腦上?)\s*(.+)", r"!pc \1", False),
+    (r"把\s*(.+?)\s*(?:關掉|關閉|關起來|關了)", r"!pc 關閉 \1", False),
     (r"(?:在|用)?\s*youtube\s*(?:上)?\s*(?:播放?|放|看|聽|找|搜尋?)\s*(.+)", r"!pc youtube 搜尋 \1", False),
     (r"(?:在|用)?\s*google\s*(?:上)?\s*(?:搜尋?|查|找)\s*(.+)", r"!pc google 搜尋 \1", False),
     (r"(?:播放|放|聽)\s*(?!音樂|歌)(.+?)\s*(?:的)?\s*(?:歌曲?|音樂|mv)", r"!pc youtube 搜尋 \1", False),
@@ -2719,8 +2737,10 @@ PC_ALIASES = {r"油管|優兔|u\s*tube|you\s*tube": "youtube", r"谷歌|估狗|�
               r"\big\b|哀居": "instagram", r"網飛": "netflix", r"谷歌瀏覽器|google\s*chrome|瀏覽器": "chrome",
               r"筆記本|記事簿": "記事本", r"計算器|計數機": "計算機", r"檔案管理員?|我的電腦": "檔案總管",
               r"git\s*hub": "github", r"chat\s*gpt": "chatgpt", r"g\s*mail": "gmail",
-              r"調大|開大|大聲一?點": "調高", r"調小|關小|小聲一?點": "調低"}
-PC_OPEN = re.compile(r"(?:打開|開啟|啟動|執行|叫出|開一下|開|去|進|看|聽|播放|暫停|繼續播放|下一首|上一首|靜音|音量|大聲|小聲|調(?:高|低|大|小))")
+              r"調大|開大|大聲一?點": "調高", r"調小|關小|小聲一?點": "調低",
+              r"^(?:(?:再|在)一首|下一手)$": "下一首", r"\bgp\b|gbu|gpo": "gpu",
+              r"^kai\s*ste(?:en|in)": "開steam", r"ス[テチ][ィイ]?ー?[ンム]|(?<![a-z])st(?:ing|een|ein)(?![a-z])": "steam"}   # 實測常聽錯的
+PC_OPEN = re.compile(r"(?:關閉|關掉|打開|開啟|啟動|執行|叫出|開一下|開|去|進|看|聽|播放|暫停|繼續播放|下一首|上一首|靜音|音量|大聲|小聲|調(?:高|低|大|小))")
 PC_SPLIT = re.compile(r"\s*(?:然後|接著|之後|再來|再|並且|並|順便|跟|和)\s*")
 
 
@@ -2733,6 +2753,8 @@ def pc_hint_words() -> str:
 def spoken_pc(t: str, owner: bool) -> list:
     """口說的開 app／媒體鍵要求 → 依序執行的 !pc 指令（「打開記事本然後開 YouTube」會拆成兩步）；不是就回傳 []。"""
     t = re.sub(r"(?:一下|一點|吧|好嗎|好不好|謝謝|給我|拜託)+$", "", t).strip()
+    if re.match(r"關於\s*\S+$", t) and pc_keyword_plan("打開" + t[2:].strip()):   # 「關閉 YouTube」常被聽成「關於 YouTube」
+        t = "關閉" + t[2:]
     parts = [p if i == 0 or PC_OPEN.match(p) else "打開" + p for i, p in enumerate(PC_SPLIT.split(t)) if p]   # 「打開記事本跟 YouTube」
     if len(parts) > 1 and all(PC_OPEN.search(p) and pc_keyword_plan(p) for p in parts):
         return [f"!pc {p}" for p in parts[:3]]
@@ -2743,7 +2765,7 @@ def spoken_pc(t: str, owner: bool) -> list:
                  or plan[0]["arg"].lower() in weak[1] and len(weak[1]) <= len(plan[0]["arg"]) + 2):
         return [f"!pc {t}"]
     # 擁有者明確說「打開/啟動…」但關鍵字認不出來：交給 !pc 的模型判斷，做不到它會說明能開哪些
-    return [f"!pc {t}"] if owner and re.match(r"打開|開啟|啟動|執行", t) else []
+    return [f"!pc {t}"] if owner and re.match(r"打開|開啟|啟動|執行|關閉|關掉", t) else []
 
 
 def spoken_to_command(text: str, in_session: bool, owner: bool = False):
@@ -2774,6 +2796,8 @@ async def handle_spoken(message, text: str, speak, post=None):
     posted = await (post or message.reply)(f"🎙️ {who}「{text}」" + (f" → 執行 `{cmd}`" if cmd else ""))
     if post:
         message.id, message.reply = posted.id, posted.reply
+    if not cmd and content.startswith("!ask"):   # 一般問題：提醒 AI 這是語音辨識結果、要簡短
+        content += "\n（這句話是語音辨識的結果，可能有聽錯的字；意思不清楚時請用一句話簡短確認他想做什麼。語音對話請簡短回答。）"
     texts = []
     token = speech_out.set(texts)
     try:
@@ -2802,11 +2826,12 @@ PCM_RATE = 48000 * 2 * 2   # Discord 解出來是 48 kHz 雙聲道 16-bit
 
 
 class VoiceSession:
-    PAUSE, MIN_SEC, MAX_SEC = 0.8, 0.5, 30   # 停頓 0.8 秒算一句；太短的雜音略過；最長 30 秒強制切
+    PAUSE, MIN_SEC, MAX_SEC = 1.0, 0.5, 30   # 停頓 1 秒算一句（太短會把一句話切成兩半）；太短的雜音略過；最長 30 秒強制切
+    BARGE_FRAMES, LOUD = 12, 500   # 連續約 0.24 秒有聲音（不是雜訊）就算開口：打斷正在念的回覆
 
     def __init__(self, vc, text_channel):
-        self.vc, self.text, self.bufs, self.last, self.decoders = vc, text_channel, {}, {}, {}
-        self.lock, self.talk = threading.Lock(), asyncio.Lock()
+        self.vc, self.text, self.bufs, self.last, self.decoders, self.voiced = vc, text_channel, {}, {}, {}, {}
+        self.lock, self.talk, self.speaking, self.epoch = threading.Lock(), asyncio.Lock(), asyncio.Lock(), 0   # epoch：有人開口就 +1，舊回覆就不再念
         vc._connection.add_socket_listener(self.on_packet)
         self.task = asyncio.create_task(self.loop())
 
@@ -2814,7 +2839,7 @@ class VoiceSession:
         if len(data) < 16 or data[1] & 0x7F != 120:   # 只要 Opus 語音，略過 RTCP
             return
         uid, st = voice_ssrc.get(int.from_bytes(data[8:12], "big")), self.vc._connection
-        if not uid:
+        if not uid or uid == bot.user.id:
             return
         hl = 12 + 4 * (data[0] & 0x0F) + (4 if data[0] & 0x10 else 0)
         try:
@@ -2826,40 +2851,52 @@ class VoiceSession:
             pcm = self.decoders.setdefault(uid, discord.opus.Decoder()).decode(pt)
         except Exception:
             return
+        loud = np.sqrt(np.mean(np.frombuffer(pcm, np.int16).astype(np.float32) ** 2)) > self.LOUD
         with self.lock:
+            n = self.voiced[uid] = (self.voiced.get(uid, 0) + 1 if loud else 0) if uid in self.bufs else int(loud)
             self.bufs.setdefault(uid, bytearray()).extend(pcm)
             self.last[uid] = time.monotonic()
+        if n == self.BARGE_FRAMES:   # 這句剛開口：停止念稿、之前還沒念的回覆也不念了
+            self.epoch += 1
+            if self.vc.is_playing():
+                self.vc.stop()
 
     async def loop(self):
         while self.vc.is_connected():
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
             now = time.monotonic()
             with self.lock:
                 done = [u for u, b in self.bufs.items() if now - self.last[u] > self.PAUSE or len(b) > PCM_RATE * self.MAX_SEC]
                 chunks = [(u, self.bufs.pop(u)) for u in done]
             for uid, pcm in chunks:
-                if len(pcm) > PCM_RATE * self.MIN_SEC and uid != bot.user.id:
-                    asyncio.create_task(self.utterance(uid, bytes(pcm)))
+                if len(pcm) > PCM_RATE * self.MIN_SEC:
+                    asyncio.create_task(self.utterance(uid, bytes(pcm), self.epoch))
 
-    async def utterance(self, uid: int, pcm: bytes):
-        a = np.frombuffer(pcm, np.int16).reshape(-1, 2).mean(1) / 32768
-        text = await asyncio.to_thread(transcribe, a[:len(a) // 3 * 3].reshape(-1, 3).mean(1).astype(np.float32))
+    async def utterance(self, uid: int, pcm: bytes, epoch: int):
         member = self.vc.guild.get_member(uid)
+        subject = teach_sessions.get((self.text.id, uid), {}).get("subject", "")
+        text, sure = await asyncio.to_thread(lambda: transcribe(pcm48_to16(pcm), subject))
         if not text or not member:
             return
+        speak = lambda texts: self.play(texts, epoch)
         async with self.talk:   # 一次處理一句，回覆依序念
+            if not sure:
+                await _orig_send(self.text, f"🎙️ **{member.display_name}**：沒聽清楚（好像是「{text}」），請再說一次。")
+                return await speak(["沒聽清楚，可以再說一次嗎？"])
             msg = SimpleNamespace(id=0, channel=self.text, guild=self.vc.guild, author=member, content=text,
                                   attachments=[], reference=None, mentions=[], mention_everyone=False, reply=None)
-            await handle_spoken(msg, text, self.play, lambda s: _orig_send(self.text, s))
+            await handle_spoken(msg, text, speak, lambda s: _orig_send(self.text, s))
 
-    async def play(self, texts: list):
+    async def play(self, texts: list, epoch: int = None):
         text = speakable(texts)
-        if not text or not self.vc.is_connected():
+        if not text:
             return
         pcm = await asyncio.to_thread(decode_audio, await tts_mp3(text), 48000, "stereo", "s16")
-        while self.vc.is_playing():
-            await asyncio.sleep(0.2)
-        self.vc.play(discord.PCMAudio(io.BytesIO(pcm.tobytes())))
+        async with self.speaking:   # 一段念完才念下一段
+            while self.vc.is_playing():
+                await asyncio.sleep(0.1)
+            if self.vc.is_connected() and (epoch is None or epoch == self.epoch):   # 使用者之後又開口了 → 這段不念
+                self.vc.play(discord.PCMAudio(io.BytesIO(pcm.tobytes())))
 
 
 async def handle_voice_command(message, arg: str):
@@ -2966,13 +3003,14 @@ async def on_message(message):
                  or bot.user.mentioned_in(message) or getattr(ref, "author", None) == bot.user)
     async with message.channel.typing():
         try:
-            text = await asyncio.to_thread(transcribe, await asyncio.to_thread(decode_audio, await audio.read()))
+            text, sure = await asyncio.to_thread(transcribe, await asyncio.to_thread(decode_audio, await audio.read()),
+                                                 teach_sessions.get(key, {}).get("subject", ""))
         except Exception as e:
             return await message.reply(f"❌ 語音辨識失敗：{str(e)[:300]}")
     if not addressed and not (text and (await asyncio.to_thread(spoken_to_command, text, False))[1]):
         return
-    if not text:
-        return await message.reply("🎙️ 沒聽清楚，可以再說一次嗎？")
+    if not text or not sure:
+        return await message.reply(f"🎙️ 沒聽清楚{f'（好像是「{text}」）' if text else ''}，可以再說一次嗎？")
     await handle_spoken(message, text, lambda texts: send_voice_reply(message, texts))
 
 
