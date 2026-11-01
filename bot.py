@@ -1307,9 +1307,10 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
 #   4. 連續 30 秒都沒偵測到（使用率未超過門檻、清單程式也沒執行）才自動恢復，再通知一次。
 GPU_GUARD_ENABLED = getenv_user("GPU_GUARD", "1") != "0"
 GPU_POLL_SECONDS = max(1.0, float(getenv_user("GPU_POLL_SECONDS", "3")))
-GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "75"))   # 超過即暫停；設 0 可關閉使用率偵測
+GPU_UTIL_THRESHOLD = float(getenv_user("GPU_UTIL_THRESHOLD", "55"))   # 持續超過即暫停；設 0 可關閉使用率偵測
 PAUSE_AFTER_POLLS = 2          # 清單內程式連續出現 2 次（約 6 秒）才暫停，避免啟動器一閃而過
 RESUME_AFTER_SECONDS = 30      # 連續 30 秒都沒事才恢復，避免反覆切換
+UTIL_SUSTAIN_SECONDS = 10      # 使用率要持續超過門檻 10 秒才暫停，忽略瞬間峰值
 NOTIFY_USER_IDS = set(ALLOWED_USER_IDS)   # 暫停/恢復時私訊誰；預設是擁有者
 GPU_GUARD_FILE = os.path.abspath("./gpu_guard.json")
 GPU_STATE_FILE = os.path.join(BASE_DIR, "gpu_state.json")
@@ -1521,7 +1522,8 @@ class GpuGuard:
         self.reason = ""
         self.since = None
         self.busy = 0                  # Bot 自己正在跑的 GPU 工作數（只在事件迴圈執行緒修改）
-        self.hot_polls = 0
+        self.hot_polls = 0             # 清單內程式連續出現的次數
+        self.util_since = None         # 使用率開始持續超過門檻的時間
         self.last_hot = 0.0            # 最後一次偵測到忙碌的時間（time.monotonic）
         self.tick = 0
         self.override = set()          # 擁有者手動恢復時，暫時忽略這些正在執行的程式
@@ -1551,19 +1553,18 @@ class GpuGuard:
         util_hot = raw_util_hot and not self.util_ignore and (self.paused or self.busy == 0 or self_excluded)
         hot = bool(effective) or util_hot
 
+        self.hot_polls = self.hot_polls + 1 if effective else 0
+        self.util_since = (now if self.util_since is None else self.util_since) if util_hot else None
         if hot:
-            self.hot_polls += 1
             self.last_hot = now
             if effective:
                 self.reason = "偵測到「" + "、".join(sorted(effective)) + "」正在執行"
             else:
                 who = f"，主要來自「{self.top_app}」" if self.top_app else ""
                 self.reason = f"GPU 使用率偏高（{util:.0f}%{who}）"
-        else:
-            self.hot_polls = 0
 
         if not self.paused:
-            if util_hot or self.hot_polls >= PAUSE_AFTER_POLLS:   # 使用率超過門檻立即暫停
+            if self.hot_polls >= PAUSE_AFTER_POLLS or (util_hot and now - self.util_since >= UTIL_SUSTAIN_SECONDS):
                 self.paused, self.since = True, datetime.now()
                 return "pause"
         elif now - self.last_hot >= RESUME_AFTER_SECONDS:
@@ -1581,7 +1582,7 @@ class GpuGuard:
         self.manual = self.paused = False
         self.override = set(self.last_triggers)
         self.util_ignore = True
-        self.hot_polls = 0
+        self.hot_polls, self.util_since = 0, None
         return was
 
     def paused_for(self) -> str:
