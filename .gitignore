@@ -15,3 +15,4 @@ gpu_state.json
 claude_outputs/
 bot.py.bak*
 evolve/
+selfcheck/
