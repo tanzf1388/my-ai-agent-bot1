@@ -1209,7 +1209,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
-            "`!hf [schnell|krea|qwen] 描述`　（限擁有者）Claude 寫提示詞、用 Hugging Face 生圖（不佔 GPU）；schnell 快速（預設）、krea 寫實質感、qwen 適合圖中有文字\n"
+            "`!hf [schnell|krea|qwen] 描述`　（限擁有者）Claude 寫提示詞、用 Hugging Face 免費 Space 生圖（不佔 GPU，每日額度有限）；schnell 快速（預設）、krea 寫實質感、qwen 適合圖中有文字\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
             "`!anim [長度] 描述`　由 Claude 寫程式動畫並錄成影片，例如 `!anim 30秒 星空`（預設 15 秒，最長 10 分鐘；寫程式約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
@@ -2243,20 +2243,26 @@ async def handle_svg_command(message, prompt: str) -> bool:
         return False
 
 
-HF_MODELS = {"schnell": "fal-ai/flux/schnell", "krea": "fal-ai/flux/krea", "qwen": "fal-ai/qwen-image"}
+HF_SPACES = {   # 免費 ZeroGPU Space：模型 → (網域, API, 提示詞以外的參數)
+    "schnell": ("black-forest-labs-flux-1-schnell", "infer", [0, True, 1024, 1024, 4]),
+    "krea": ("mcp-tools-flux-1-krea-dev", "infer", [0, True, 768, 768, 4.5, 24]),
+    "qwen": ("mcp-tools-qwen-image", "generate_image", [0, True, "1:1", "watermark, blurry, low resolution", 4.0, 16]),
+}
 
 
 def hf_image(prompt: str, model: str):
-    """透過 Hugging Face Inference Providers（fal）生圖，回傳 (圖片位元組, 副檔名)。"""
-    r = requests.post(f"https://router.huggingface.co/fal-ai/{HF_MODELS[model]}",
-                      headers={"Authorization": f"Bearer {getenv_user('HF_TOKEN')}"},
-                      json={"prompt": prompt, "sync_mode": True}, timeout=180)
+    """呼叫 Hugging Face 免費 Space 生圖（Gradio API），回傳 (圖片位元組, 副檔名)。"""
+    host, api, args = HF_SPACES[model]
+    url, auth = f"https://{host}.hf.space/gradio_api/call/{api}", {"Authorization": f"Bearer {getenv_user('HF_TOKEN')}"}
+    r = requests.post(url, headers=auth, json={"data": [prompt, *args]}, timeout=60)
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}：{r.text[:300]}")
-    img = r.json()["images"][0]
-    url = img["url"]
-    data = base64.b64decode(url.split(",", 1)[1]) if url.startswith("data:") else requests.get(url, timeout=60).content
-    return data, img.get("content_type", "image/jpeg").split("/")[1]
+    r = requests.get(f"{url}/{r.json()['event_id']}", headers=auth, timeout=300)   # 排隊＋生成，完成後連線才結束
+    done = re.search(r"event: complete\s+data: (.*)", r.text)
+    if not done:
+        raise RuntimeError(f"Space 沒有產出圖片（可能是今天的免費額度用完或正在忙碌）：{r.text[-300:]}")
+    img = json.loads(done[1])[0]["url"]
+    return requests.get(img, headers=auth, timeout=60).content, img.rsplit(".", 1)[-1]
 
 
 async def handle_hf_command(message, prompt: str):
