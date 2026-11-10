@@ -1209,7 +1209,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
-            "`!hf 描述`　（限擁有者）Claude 寫提示詞、用 Hugging Face 生圖（不佔 GPU）\n"
+            "`!hf [schnell|krea|qwen] 描述`　（限擁有者）Claude 寫提示詞、用 Hugging Face 生圖（不佔 GPU）；schnell 快速（預設）、krea 寫實質感、qwen 適合圖中有文字\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
             "`!anim [長度] 描述`　由 Claude 寫程式動畫並錄成影片，例如 `!anim 30秒 星空`（預設 15 秒，最長 10 分鐘；寫程式約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
@@ -2243,40 +2243,45 @@ async def handle_svg_command(message, prompt: str) -> bool:
         return False
 
 
-HF_IMAGE_MODEL = getenv_user("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+HF_MODELS = {"schnell": "fal-ai/flux/schnell", "krea": "fal-ai/flux/krea", "qwen": "fal-ai/qwen-image"}
 
 
-def hf_image(prompt: str):
-    """用 Hugging Face 推論 API 生圖，回傳 (圖片位元組, 副檔名)。"""
-    r = requests.post(f"https://router.huggingface.co/hf-inference/models/{HF_IMAGE_MODEL}",
-                      headers={"Authorization": f"Bearer {getenv_user('HF_TOKEN')}"}, json={"inputs": prompt}, timeout=180)
-    kind = r.headers.get("content-type", "")
-    if not r.ok or not kind.startswith("image/"):
+def hf_image(prompt: str, model: str):
+    """透過 Hugging Face Inference Providers（fal）生圖，回傳 (圖片位元組, 副檔名)。"""
+    r = requests.post(f"https://router.huggingface.co/fal-ai/{HF_MODELS[model]}",
+                      headers={"Authorization": f"Bearer {getenv_user('HF_TOKEN')}"},
+                      json={"prompt": prompt, "sync_mode": True}, timeout=180)
+    if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}：{r.text[:300]}")
-    return r.content, kind.split("/")[1].split(";")[0]
+    img = r.json()["images"][0]
+    url = img["url"]
+    data = base64.b64decode(url.split(",", 1)[1]) if url.startswith("data:") else requests.get(url, timeout=60).content
+    return data, img.get("content_type", "image/jpeg").split("/")[1]
 
 
 async def handle_hf_command(message, prompt: str):
     if message.author.id not in ALLOWED_USER_IDS:
         return await message.reply("🔒 `!hf` 僅限擁有者使用。")
+    m = re.match(r"(krea|qwen|schnell)(?![a-z])\s*(.*)", prompt, re.I | re.S)
+    model, prompt = (m[1].lower(), m[2].strip()) if m else ("schnell", prompt)
     if not prompt:
-        return await message.reply("用法：`!hf 描述`，例如 `!hf 一隻在雨中撐傘的柴犬，水彩風格`")
+        return await message.reply("用法：`!hf [schnell|krea|qwen] 描述`，例如 `!hf krea 一隻在雨中撐傘的柴犬，水彩風格`（沒寫模型就用 schnell）")
     if not getenv_user("HF_TOKEN"):
         return await message.reply("❌ 尚未設定 Hugging Face token：請在 Windows 使用者環境變數加入 `HF_TOKEN`。")
     status = await message.reply("✏️ Claude 正在寫提示詞…")
     try:
         try:
-            en = (await asyncio.to_thread(claude_ask, "把以下描述改寫成適合 FLUX 生圖模型的英文提示詞，只輸出提示詞本身，"
+            en = (await asyncio.to_thread(claude_ask, "把以下描述改寫成適合生圖模型的英文提示詞，圖中要出現的文字保留原文，只輸出提示詞本身，"
                                           f"不要任何說明：\n{prompt}", None, 120)).strip()[:1500]
         except Exception:   # Claude 不能用時直接拿原描述生圖
             en = prompt
-        await status.edit(content="🎨 正在用 Hugging Face 生圖…")
-        data, ext = await asyncio.to_thread(hf_image, en)
+        await status.edit(content=f"🎨 正在用 Hugging Face（{model}）生圖…")
+        data, ext = await asyncio.to_thread(hf_image, en, model)
         os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
         path = os.path.join(CLAUDE_OUT_DIR, f"hf_{datetime.now():%Y%m%d_%H%M%S}.{ext}")
         with open(path, "wb") as f:
             f.write(data)
-        await message.reply(f"✅ 圖片完成（Hugging Face）：{prompt[:300]}", file=discord.File(path))
+        await message.reply(f"✅ 圖片完成（Hugging Face {model}）：{prompt[:300]}", file=discord.File(path))
         await status.delete()
     except Exception as e:
         await status.edit(content=f"❌ Hugging Face 生圖失敗：{str(e)[:500]}")
