@@ -1209,6 +1209,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**🎨 生圖 / 生影片（ComfyUI）**\n"
             "`!image 描述`　生成圖片，例如 `!image 夕陽下的台北 101，水彩風格`（`!img` 也可以）\n"
             "`!svg 描述`　由 Claude 用 SVG 繪製（不佔 GPU；本機生圖要排隊或 GPU 暫停時 `!image` 也會自動改用這個）\n"
+            "`!hf 描述`　（限擁有者）Claude 寫提示詞、用 Hugging Face 生圖（不佔 GPU）\n"
             "`!video 描述`　生成約 3 秒的短影片（約需 15 分鐘）\n"
             "`!anim [長度] 描述`　由 Claude 寫程式動畫並錄成影片，例如 `!anim 30秒 星空`（預設 15 秒，最長 10 分鐘；寫程式約 10 分鐘，不佔 GPU；本機忙碌時 `!video` 也會改用這個）\n\n"
             "**📝 學習檢測指令**\n"
@@ -1959,7 +1960,8 @@ def find_claude() -> str:
     （桌面版是 Microsoft Store 套件，實際檔案在 Packages\\Claude_*\\LocalCache 底下）。"""
     exe = getenv_user("CLAUDE_CLI") or shutil.which("claude")
     if not exe:
-        found = [p for pat in (r"%APPDATA%\Claude\claude-code\*\*\claude.exe",
+        found = [p for pat in (r"%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\*\*\claude.exe",
+                               r"%APPDATA%\Claude\claude-code\*\*\claude.exe",
                                r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\*\*\claude.exe")
                  for p in glob.glob(os.path.expandvars(pat))]
         exe = max(found, key=os.path.getmtime) if found else None
@@ -2239,6 +2241,45 @@ async def handle_svg_command(message, prompt: str) -> bool:
     except Exception as e:
         await status.edit(content=f"❌ SVG 繪製失敗：{str(e)[:500]}")
         return False
+
+
+HF_IMAGE_MODEL = getenv_user("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+
+
+def hf_image(prompt: str):
+    """用 Hugging Face 推論 API 生圖，回傳 (圖片位元組, 副檔名)。"""
+    r = requests.post(f"https://router.huggingface.co/hf-inference/models/{HF_IMAGE_MODEL}",
+                      headers={"Authorization": f"Bearer {getenv_user('HF_TOKEN')}"}, json={"inputs": prompt}, timeout=180)
+    kind = r.headers.get("content-type", "")
+    if not r.ok or not kind.startswith("image/"):
+        raise RuntimeError(f"HTTP {r.status_code}：{r.text[:300]}")
+    return r.content, kind.split("/")[1].split(";")[0]
+
+
+async def handle_hf_command(message, prompt: str):
+    if message.author.id not in ALLOWED_USER_IDS:
+        return await message.reply("🔒 `!hf` 僅限擁有者使用。")
+    if not prompt:
+        return await message.reply("用法：`!hf 描述`，例如 `!hf 一隻在雨中撐傘的柴犬，水彩風格`")
+    if not getenv_user("HF_TOKEN"):
+        return await message.reply("❌ 尚未設定 Hugging Face token：請在 Windows 使用者環境變數加入 `HF_TOKEN`。")
+    status = await message.reply("✏️ Claude 正在寫提示詞…")
+    try:
+        try:
+            en = (await asyncio.to_thread(claude_ask, "把以下描述改寫成適合 FLUX 生圖模型的英文提示詞，只輸出提示詞本身，"
+                                          f"不要任何說明：\n{prompt}", None, 120)).strip()[:1500]
+        except Exception:   # Claude 不能用時直接拿原描述生圖
+            en = prompt
+        await status.edit(content="🎨 正在用 Hugging Face 生圖…")
+        data, ext = await asyncio.to_thread(hf_image, en)
+        os.makedirs(CLAUDE_OUT_DIR, exist_ok=True)
+        path = os.path.join(CLAUDE_OUT_DIR, f"hf_{datetime.now():%Y%m%d_%H%M%S}.{ext}")
+        with open(path, "wb") as f:
+            f.write(data)
+        await message.reply(f"✅ 圖片完成（Hugging Face）：{prompt[:300]}", file=discord.File(path))
+        await status.delete()
+    except Exception as e:
+        await status.edit(content=f"❌ Hugging Face 生圖失敗：{str(e)[:500]}")
 
 
 def local_ask(prompt: str) -> str:
@@ -2726,6 +2767,7 @@ VOICE_COMMANDS = [
     (r"(?:更新|建立|重建)\s*(?:圖片|資料[夾加])?\s*索引", "!index", False),
     (r"(?:有(?:哪些|什麼)指令|指令(?:清單|列表|說明)?|使用說明|help)", "!help", False),
     (r"(?:組隊|團隊合作|一起合作|協作)\s*(.+)", r"!team \1", False),
+    (r"(?:用\s*)?(?:hf|hugging\s*face)\s*(?:畫|生成|產生)?\s*(.+)", r"!hf \1", False),
     (r"(?:用\s*)?svg\s*(?:畫)?\s*(.+)", r"!svg \1", False),
     (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:程式)?動畫\s*(.*)", r"!anim \1", False),
     (r"(?:生成|產生|做)\s*(?:一(?:支|段|部|個))?\s*(?:短)?影片\s*(.*)", r"!video \1", False),
@@ -3244,7 +3286,7 @@ async def on_text(message, content: str = None):
     is_gpu_cmd = bool(re.match(r"^!(gpu|model|evolve)\b", clean_input, flags=re.I))
     # !ask 問題：在伺服器頻道不用 @Bot 也能直接問 AI
     ask_match = re.match(r"^!ask\b\s*(.*)$", clean_input, flags=re.I | re.S)
-    gen_match = re.match(r"^!(image|img|video|svg|anim)\b\s*(.*)$", clean_input, flags=re.I | re.S)
+    gen_match = re.match(r"^!(image|img|video|svg|anim|hf)\b\s*(.*)$", clean_input, flags=re.I | re.S)
     team_match = re.match(r"^!team\b\s*(.*)$", clean_input, flags=re.I | re.S)
     teach_match = re.match(r"^!teach\b\s*(.*)$", clean_input, flags=re.I | re.S)
     pc_match = re.match(r"^!pc\b\s*(.*)$", clean_input, flags=re.I | re.S)
@@ -3263,6 +3305,9 @@ async def on_text(message, content: str = None):
         return
     if team_match:
         await handle_team_command(message, team_match.group(1).strip())
+        return
+    if gen_match and gen_match.group(1).lower() == "hf":
+        await handle_hf_command(message, gen_match.group(2).strip())
         return
     if gen_match and gen_match.group(1).lower() in ("svg", "anim"):
         await (handle_svg_command if gen_match.group(1).lower() == "svg" else handle_anim_command)(message, gen_match.group(2).strip())
