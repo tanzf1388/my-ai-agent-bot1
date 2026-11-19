@@ -798,8 +798,8 @@ except Exception:
     image_cache = {}
 
 
-def list_reference_files(exts) -> list:
-    return sorted(p for p in glob.glob(os.path.join(DOCS_REF_DIR, "**", "*"), recursive=True)
+def list_reference_files(exts, base: str = DOCS_REF_DIR) -> list:
+    return sorted(p for p in glob.glob(os.path.join(base, "**", "*"), recursive=True)
                   if p.lower().endswith(exts))
 
 
@@ -821,11 +821,11 @@ def ocr_image(path: str) -> str:
     return text
 
 
-def folder_material(topic: str, limit: int = 4000):
-    """在 reference_docs 找與主題相關的圖片與 .txt/.md，回傳 (材料文字, 檔案數)。
+def folder_material(topic: str, limit: int = 4000, base: str = DOCS_REF_DIR):
+    """在 reference_docs（或其子資料夾 base）找與主題相關的圖片與 .txt/.md，回傳 (材料文字, 檔案數)。
     比對『路徑』（例如 數學/極限/）與『已辨識的內容』，每次隨機抽不同頁讓題目有變化。"""
     words = topic.lower().split()
-    files = list_reference_files(IMAGE_EXTS + (".txt", ".md"))
+    files = list_reference_files(IMAGE_EXTS + (".txt", ".md"), base)
     random.shuffle(files)
     subjects = {d.lower() for d in os.listdir(TEACH_DIR)} if os.path.isdir(TEACH_DIR) else set()
     parts, size, new_ocr = [], 0, 0
@@ -854,6 +854,27 @@ def folder_material(topic: str, limit: int = 4000):
         parts.append(f"【{rel}】\n{text}")
         size += len(text)
     return "\n\n".join(parts), len(parts)
+
+
+HW_DIR = os.path.join(DOCS_REF_DIR, "作業")   # 「作業」專案的作業放這裡（可依科目分子資料夾），`!quiz 作業` 從這裡出題
+os.makedirs(HW_DIR, exist_ok=True)
+HW_SECTION_RE = re.compile(r"【[^】]*(?:作業|練習)[^】]*】.*?(?=\n【|\Z)", re.S)
+HW_NOTE = ("以下是學生的作業（可能附標準答案）。請直接用作業裡的原題出題（大題可拆成小題，隨機挑選，不必從第 1 題開始），"
+           "有標準答案就以標準答案為準。\n")
+
+
+def homework_material(uid: int, subject: str = ""):
+    """`!quiz 作業` 的材料：reference_docs/作業 裡的檔案，加上老師模式出的回家作業（上課紀錄裡附標準答案的段落）。"""
+    material, count = folder_material(subject, base=HW_DIR)
+    for p in glob.glob(os.path.join(TEACH_DIR, "*", f"{uid}.md")):
+        subj = os.path.basename(os.path.dirname(p))
+        if subject.lower() in subj.lower():
+            with open(p, encoding="utf-8") as f:
+                secs = HW_SECTION_RE.findall(f.read())
+            if secs:
+                material += f"\n\n【老師模式作業：{subj}】\n" + "\n".join(secs)
+                count += 1
+    return material.strip(), count
 
 
 indexing = False
@@ -1214,6 +1235,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             "**📝 學習檢測指令**\n"
             "`!quiz 主題 [題數]`　出題檢測，例如 `!quiz Python 迴圈 5`\n"
             "`!quiz`＋附上筆記/課本圖片　根據圖片內容出題\n"
+            "`!quiz 作業 [科目] [題數]`　用 reference_docs/作業 裡的作業（和老師模式出的回家作業）原題出題，例如 `!quiz 作業 數學 5`\n"
             "　　沒附圖時會先到 reference_docs 資料夾（含子資料夾）找相關的圖片/筆記當出題材料\n"
             "`!index`　立即更新資料夾圖片索引（平常每 5 天自動更新），之後出題更快、也能依圖片內容查找\n"
             "`!review [題數]`　複習錯題本（依間隔複習到期的題目）\n"
@@ -1269,7 +1291,15 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             return True
         topic, n = parse_quiz_args(arg)
         material, source_note = "", ""
-        if images_b64:
+        hw = None if images_b64 else re.match(r"^(?:作業(?!系統)|homework\b|hw\b)\s*(.*)$", topic, flags=re.I)
+        if hw:
+            material, count = await run_gpu(homework_material, message.author.id, hw[1].strip())
+            if not count:
+                await message.reply(f"📭 找不到{hw[1].strip()}作業。把作業（文字檔、.md 或照片，可依科目分子資料夾）放進 "
+                                    "`reference_docs/作業`，再輸入 `!quiz 作業` 或 `!quiz 作業 數學 5`。")
+                return True
+            topic, material, source_note = f"{hw[1].strip()}作業", HW_NOTE + material, f"（依據 {count} 份作業）"
+        elif images_b64:
             extracted = await run_gpu(
                 vision_chat, images_b64,
                 "請把這些圖片中的學習內容完整整理成繁體中文文字：抄錄所有文字，並描述圖表、公式、流程的重點。不要加入圖片以外的內容。")
@@ -1286,7 +1316,7 @@ async def handle_learning_command(message, content: str, images_b64: list) -> bo
             await message.reply("請告訴我要檢測的主題，例如：`!quiz Python 迴圈 5`，或附上筆記圖片再輸入 `!quiz`。")
             return True
 
-        questions = await run_gpu(generate_questions, topic, n, material, recent_questions(message.author.id, topic))
+        questions = await run_gpu(generate_questions, topic, n, material, [] if hw else recent_questions(message.author.id, topic))
         if not questions:
             await message.reply("❌ 這次沒能產生合格的題目（本機模型輸出格式不穩），請再試一次，或換個更具體的主題。")
             return True
