@@ -9,7 +9,12 @@ Discord + Ollama AI Agent Bot（主程式：`bot.py`）。
 | `!ask 問題` | 直接問 AI，在伺服器頻道不用 @Bot（可附上圖片一起問） |
 | `!image 描述` | 用本機 ComfyUI 生成圖片（`!img` 也可以） |
 | `!video 描述` | 用本機 ComfyUI 生成約 3 秒的短影片（RX 9070 XT 約 15 分鐘） |
+| `!hf 描述` | （限擁有者）用 Hugging Face 免費 Space 生圖，不佔本機 GPU |
+| `!quiz 作業 [科目]` | 用作業資料夾的原題出題 |
+| `!evolve` / `!selfcheck` | 看自我學習與自我檢查狀態 |
 | `!help` | 查看所有指令 |
+
+更新紀錄見 [CHANGELOG.md](CHANGELOG.md)。
 
 私訊 Bot 或在頻道 @Bot 也可以直接對話。
 
